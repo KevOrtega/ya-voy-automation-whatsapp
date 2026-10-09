@@ -166,6 +166,12 @@ class Order(Base):
             postgresql_where=text(sql_in("status", PENDING_STATUSES)),
         ),
         Index("orders_business_date_idx", "business_date"),
+        # Retention (RNF-10): rows still to anonymize, oldest first.
+        Index(
+            "orders_retention_idx",
+            "business_date",
+            postgresql_where=text("anonymized_at IS NULL"),
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -210,6 +216,12 @@ class OrderEvent(Base):
         CheckConstraint(sql_in("actor_type", ActorType), name="actor_type_check"),
         Index("order_events_order_id_created_at_idx", "order_id", "created_at"),
         Index("order_events_created_at_courier_id_idx", "created_at", "courier_id"),
+        # Retention (RNF-10): rows still to anonymize, oldest first.
+        Index(
+            "order_events_retention_idx",
+            "created_at",
+            postgresql_where=text("anonymized_at IS NULL"),
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -223,6 +235,7 @@ class OrderEvent(Base):
     inbound_event_id: Mapped[int | None] = _fk("inbound_events.id")
     data: Mapped[dict[str, Any]] = _jsonb("{}")
     created_at: Mapped[dt.datetime] = _ts_now()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()
 
 
 class InboundEvent(Base):
@@ -234,6 +247,12 @@ class InboundEvent(Base):
             "status",
             "received_at",
             postgresql_where=text("status IN ('received', 'failed')"),
+        ),
+        # Retention (RNF-10): rows still to anonymize, oldest first.
+        Index(
+            "inbound_events_retention_idx",
+            "received_at",
+            postgresql_where=text("anonymized_at IS NULL"),
         ),
     )
 
@@ -249,6 +268,7 @@ class InboundEvent(Base):
     error: Mapped[str | None] = mapped_column(Text)
     received_at: Mapped[dt.datetime] = _ts_now()
     processed_at: Mapped[dt.datetime | None] = _ts()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()
 
 
 class Message(Base):
@@ -266,6 +286,12 @@ class Message(Base):
         Index("messages_chat_jid_created_at_idx", "chat_jid", "created_at"),
         Index("messages_order_id_idx", "order_id"),
         Index("messages_wa_message_id_idx", "wa_message_id"),
+        # Retention (RNF-10): rows still to anonymize, oldest first.
+        Index(
+            "messages_retention_idx",
+            "created_at",
+            postgresql_where=text("anonymized_at IS NULL"),
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -282,6 +308,7 @@ class Message(Base):
     inbound_event_id: Mapped[int | None] = _fk("inbound_events.id")
     outbound_message_id: Mapped[int | None] = _fk("outbound_messages.id")
     created_at: Mapped[dt.datetime] = _ts_now()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()
 
 
 class OutboundMessage(Base):
@@ -312,6 +339,12 @@ class OutboundMessage(Base):
             "id",
             postgresql_where=text("status IN ('pending', 'sending')"),
         ),
+        # Retention (RNF-10): rows still to anonymize, oldest first.
+        Index(
+            "outbound_messages_retention_idx",
+            "created_at",
+            postgresql_where=text("anonymized_at IS NULL"),
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -330,6 +363,7 @@ class OutboundMessage(Base):
     wa_message_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = _ts_now()
     sent_at: Mapped[dt.datetime | None] = _ts()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()
 
 
 class DailyReport(Base):
@@ -373,6 +407,7 @@ class ReportRevision(Base):
     generated_at: Mapped[dt.datetime | None] = _ts()
     sent_at: Mapped[dt.datetime | None] = _ts()
     created_at: Mapped[dt.datetime] = _ts_now()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()  # file removed by retention (RNF-10)
 
 
 class ScheduleOverride(Base):
@@ -440,6 +475,7 @@ class ScheduleOverride(Base):
     cancelled_at: Mapped[dt.datetime | None] = _ts()
     cancelled_by_override_id: Mapped[int | None] = _fk("schedule_overrides.id")
     created_at: Mapped[dt.datetime] = _ts_now()
+    anonymized_at: Mapped[dt.datetime | None] = _ts()
 
 
 class ParkedReaction(Base):
