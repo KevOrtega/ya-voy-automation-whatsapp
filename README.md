@@ -10,10 +10,11 @@ alerts, and gets a daily `.xlsx` report once all of the day's orders are resolve
 labeled correction if an order changes afterwards. There is no delivery tracking: an order
 is done once claimed.
 
-> Status: **design phase**. This repository currently contains only the system analysis
-> and design documents. No application code yet.
+> Status: **stage 1 (development environment and skeleton)**. Docker Compose stack, FastAPI app
+> with `/health` and a stub webhook, arq worker with a placeholder job, async Alembic (no
+> migrations yet). No business logic or data model yet.
 
-## Stack (planned)
+## Stack
 
 - Python + FastAPI (webhook receiver)
 - arq worker (background processing, outbound messages, scheduled tasks, daily report with openpyxl)
@@ -22,6 +23,44 @@ is done once claimed.
 - Evolution API (WhatsApp gateway, Baileys-based)
 - LLM (provider-agnostic) for structured order extraction only
 - Docker Compose for local development; Dokku on a VPS for production
+
+## Development setup
+
+Requirements: Docker with the Compose plugin, Python 3.12+ (only to run tests/lint locally), `make`.
+
+```bash
+make env          # creates .env from .env.example with random EVOLUTION_API_KEY / WEBHOOK_SECRET
+make up           # docker compose up -d --build: postgres, redis, evolution, migrate, web, worker
+make ps           # all services should be healthy (migrate exits 0)
+curl localhost:8000/health   # {"status":"ok","checks":{"database":"ok","redis":"ok"}}
+make logs         # follow web + worker logs (JSON)
+make down         # stop (make clean also deletes volumes, including the WhatsApp session)
+```
+
+| Service | Host port | Notes |
+|---------|-----------|-------|
+| `web` | 8000 | FastAPI (`--reload`, code mounted). `GET /health`, `POST /webhooks/evolution/{WEBHOOK_SECRET}`. |
+| `worker` | — | `arq ya_voy.worker.WorkerSettings --watch ya_voy`. |
+| `migrate` | — | `alembic upgrade head`, runs once before `web`/`worker`. |
+| `evolution` | 8080 | Evolution API `v2.3.7`; manager and QR at <http://localhost:8080/manager> (API key = `EVOLUTION_API_KEY`). Use a test number, never the production one. |
+| `postgres` | 5432 | User/password `yavoy`/`yavoy`; databases `yavoy` (app) and `evolution`. |
+| `redis` | 6379 | DB 0: arq queue; DB 1: Evolution cache. |
+
+Local tooling (outside Docker; tests don't need Postgres or Redis):
+
+```bash
+make venv         # .venv with the app and dev dependencies
+make test         # pytest
+make lint         # ruff check + ruff format --check
+make format       # ruff --fix + format
+```
+
+Inside Docker: `docker compose run --rm --no-deps web pytest`. New migrations (stage 2 onwards):
+`make revision m="create orders"`, then `make migrate`.
+
+All settings are environment variables (see [`.env.example`](.env.example) and
+[architecture §6](docs/06-arquitectura.md#6-variables-de-entorno)). `DATABASE_URL` accepts the
+`postgres://` form injected by Dokku and is converted to `postgresql+asyncpg://`.
 
 ## Documentation
 
