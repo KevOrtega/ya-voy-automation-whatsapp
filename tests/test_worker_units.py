@@ -14,6 +14,7 @@ from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import backoff_delay, send_outbound
 from ya_voy.worker.ratelimit import window_key
+from ya_voy.worker.reports import process_daily_reports, process_report_corrections
 from ya_voy.worker.routing import Route, is_private, route_event
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.settings import build_cron_jobs, cron_schedule
@@ -60,6 +61,8 @@ def test_worker_registers_stage_3_jobs_and_sweeps() -> None:
         expire_drafts,
         expire_schedule_confirmations,
         remind_still_closed,
+        process_daily_reports,
+        process_report_corrections,
     }
 
 

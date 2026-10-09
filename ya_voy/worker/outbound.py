@@ -33,6 +33,7 @@ from ya_voy.domain.enums import MessageDirection, MessageKind, OutboundMessageTy
 from ya_voy.messaging import catalog
 from ya_voy.messaging.outbox import enqueue_admin_alert, recipient_name
 from ya_voy.queue import enqueue_outbound_ids, enqueue_send_outbound
+from ya_voy.reports import service as reports
 from ya_voy.whatsapp.client import EvolutionClient, EvolutionError, SentMessage
 
 logger = logging.getLogger(__name__)
@@ -159,12 +160,19 @@ async def _send_locked(
                 "outbound message failed permanently",
                 extra={"outbound_message_id": row.id, "error": row.last_error},
             )
-        return _Outcome("failed", alert_ids=await _failure_alert(session, settings, row))
+        if row.report_revision_id is not None:
+            # The report fails as a whole: admin_daily_report_failed replaces the generic alert.
+            alert_ids = await reports.on_document_failed(session, settings, row)
+        else:
+            alert_ids = await _failure_alert(session, settings, row)
+        return _Outcome("failed", alert_ids=alert_ids)
 
     row.status = OutboundStatus.SENT
     row.wa_message_id = sent.wa_message_id
     row.sent_at = await session.scalar(select(func.now()))
     _record_sent_message(session, row)
+    if row.report_revision_id is not None:
+        await reports.on_document_sent(session, row)
     return _Outcome("sent")
 
 

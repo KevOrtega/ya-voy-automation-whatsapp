@@ -20,6 +20,7 @@ from ya_voy.worker import jobs
 from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import send_outbound
+from ya_voy.worker.reports import process_daily_reports, process_report_corrections
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.sweeps import recover_inbound_events, recover_outbound_messages
 
@@ -48,6 +49,8 @@ def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
         cron(expire_drafts, run_at_startup=True, **schedule),
         cron(expire_schedule_confirmations, run_at_startup=True, **schedule),
         cron(remind_still_closed, run_at_startup=True, **schedule),
+        cron(process_daily_reports, run_at_startup=True, **schedule),
+        cron(process_report_corrections, run_at_startup=True, **schedule),
     ]
 
 
@@ -92,7 +95,7 @@ class WorkerSettings:
         send_outbound,
         evaluate_draft,
     ]
-    # TODO(stage 5+): unclaimed alert, reports, retention.
+    # TODO(stage 5+): unclaimed alert, retention.
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown
