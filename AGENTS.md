@@ -52,10 +52,18 @@ make revision m="create orders table"   # alembic revision --autogenerate (in Do
 make migrate                            # docker compose run --rm migrate (alembic upgrade head)
 make check-migrations                   # alembic check: models and migrations must agree
 docker compose run --rm migrate alembic downgrade -1
+
+# Evolution payloads (docs/plans/real-number-verification.md)
+make replay f="tests/fixtures/evolution/private_text.json"   # POST fixtures to the running web (twice: dedup)
+CAPTURE_INBOUND_PAYLOADS=1 in .env                         # dev only: raw payloads -> data/captures/
+python -m scripts.anonymize_captures data/captures tests/fixtures/evolution/captured \
+    --mapping data/captures/pseudonyms.json                # stable pseudonyms; never commit data/
 ```
 
-Layout: `ya_voy/` package (`api/`, `worker/`, `db/` with `migrations/`, `config.py`, `queue.py`,
-`logging.py`), `tests/`. Models: `ya_voy/db/models.py`; allowed status/kind values:
+Layout: `ya_voy/` package (`api/`, `worker/` (jobs, routing, outbox sender, sweeps), `whatsapp/`
+(payload parsing, filters, dedup key, Evolution client), `messaging/` (doc 07 templates, outbox
+helpers), `db/` with `migrations/`, `config.py`, `queue.py`, `logging.py`), `scripts/`, `tests/`
+(Evolution fixtures in `tests/fixtures/evolution/`). Models: `ya_voy/db/models.py`; allowed status/kind values:
 `ya_voy/domain/enums.py` (the CHECK constraints are built from them); LLM schemas:
 `ya_voy/llm/schemas.py`. Integration tests live in `tests/integration/`, run only with
 `RUN_INTEGRATION=1` (set by `make test-docker`) and use throwaway databases (`yavoy_test`,

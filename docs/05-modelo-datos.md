@@ -383,6 +383,11 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 > de la reacción original, la deduplicación por `wa_message_id` descartaría la remoción. En ese caso
 > la clave única pasa a ser un hash de `key.id` + texto de la reacción + `messageTimestamp`.
 > Se confirma con eventos reales al armar el entorno de desarrollo.
+> La clave se calcula en un único lugar (`compute_inbound_dedup_key`, `ya_voy/whatsapp/dedup.py`), así
+> el cambio, si hace falta, no toca nada más.
+
+`payload` se guarda sin los campos del sobre que llevan secretos: `destination` (la URL del webhook,
+con `WEBHOOK_SECRET`) y `apikey` se reemplazan por `***`.
 
 ### `messages` (historial de conversación)
 

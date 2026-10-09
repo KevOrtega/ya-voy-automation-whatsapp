@@ -10,10 +10,11 @@ alerts, and gets a daily `.xlsx` report once all of the day's orders are resolve
 labeled correction if an order changes afterwards. There is no delivery tracking: an order
 is done once claimed.
 
-> Status: **stage 2 (data model and migrations)**. Docker Compose dev stack, FastAPI app with
-> `/health` and a stub webhook, arq worker with a placeholder job, and the full PostgreSQL schema
-> from [docs/05](docs/05-modelo-datos.md) as SQLAlchemy models plus one Alembic migration. No
-> business logic yet.
+> Status: **stage 3 (webhook and queue)**. Docker Compose dev stack, full PostgreSQL schema
+> ([docs/05](docs/05-modelo-datos.md)), the Evolution webhook (filtering, dedup into
+> `inbound_events`, enqueue), the worker's `process_inbound_event` skeleton with the per-sender rate
+> limit, the outbox (`send_outbound` through the Evolution REST client: FIFO per recipient, pacing,
+> retries) and the recovery sweeps. No order logic yet (stage 4+).
 
 ## Stack
 

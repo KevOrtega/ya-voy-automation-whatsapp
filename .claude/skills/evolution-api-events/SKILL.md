@@ -39,7 +39,8 @@ number) in the dedicated verification task, which is scheduled **before stage 4*
 1. **Reaction removal:** does it arrive as `messages.upsert` with empty text, and does it reuse the
    original reaction's `key.id`? If it reuses it, dedup by `wa_message_id` would drop the removal and
    the unique key becomes a hash of `key.id` + reaction text + `messageTimestamp` (note in docs/05,
-   `inbound_events`).
+   `inbound_events`). The key is computed only in `compute_inbound_dedup_key`
+   (`ya_voy/whatsapp/dedup.py`): change it there and in its tests, nowhere else.
 2. **`@lid` in groups:** which fields carry the phone (`participantAlt`, `senderPn`, ...) and when
    (RF-22, docs/05 courier merge).
 3. **Private messages to a courier known only by `@lid`:** do they deliver? (S-03, R-03; on failure,
@@ -49,14 +50,30 @@ number) in the dedicated verification task, which is scheduled **before stage 4*
 5. **Message deletion and edit in the group:** behaviour of `deleteMessageForEveryone` and
    `updateMessage`, including an old message WhatsApp no longer lets you delete (docs/06 §3, R-11).
 
+The checklist for that session (scenarios, what to record, capture and anonymization steps) is
+`docs/plans/real-number-verification.md`.
+
 Until verified, keep these behind small, well-named functions in `ya_voy/whatsapp` / `ya_voy/identity`
 with a `TODO(verify-evolution)` note and tests built from the documented shape, so the fix is local
 once real payloads exist. Do not write code that silently depends on an unverified assumption
 elsewhere.
 
+## Stage 3 facts (from the v2.3.7 source, not yet from a real number)
+
+- Envelope: `event` is lower-case dotted (`messages.upsert`, `connection.update`), plus `instance`,
+  `data`, `destination` (the webhook URL, **contains `WEBHOOK_SECRET`**), `date_time`, `sender`,
+  `server_url`, `apikey`. `destination`/`apikey` are redacted before storing or capturing
+  (`sanitize_payload`).
+- `data` for messages is Evolution's `prepareMessage`: `extendedTextMessage` is normalized to
+  `conversation`; a private `@lid` `remoteJid` is replaced by `remoteJidAlt` when present; edited
+  messages are not emitted as upserts.
+- Evolution retries a failed webhook delivery except on 400/401/403/404/422; the webhook answers
+  400 to malformed payloads (no retry loop) and 503 when the database is down (retried).
+
 ## Fixtures
 
 docs/06 §3 plans fixtures from **real** Evolution payloads (text, reaction, reaction removal, quote,
 `@lid` participant with and without alternative number, sent document) and a command to replay them
-against the webhook. When capturing them, replace real phone numbers, names and message text with
-fake ones before committing (RNF-09). Keep the original structure and field names untouched.
+against the webhook (`scripts/replay_fixture.py`). Capture with `CAPTURE_INBOUND_PAYLOADS=1` and
+anonymize with `scripts/anonymize_captures.py`: real phone numbers, names and message text must be
+replaced with fake ones before committing (RNF-09). Keep the original structure and field names untouched.

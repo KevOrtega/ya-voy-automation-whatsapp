@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: help env venv up down logs ps test test-docker lint format migrate revision check-migrations shell-web psql redis-cli clean
+.PHONY: help env venv up down logs ps test test-docker lint format migrate revision check-migrations replay shell-web psql redis-cli clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -55,6 +55,9 @@ revision: ## Autogenerate a migration: make revision m="create orders"
 
 check-migrations: ## Fail if the models differ from the migrations (alembic check, in Docker)
 	$(COMPOSE) run --rm migrate alembic check
+
+replay: ## POST Evolution fixtures to the running web twice: make replay f="tests/fixtures/evolution/*.json"
+	$(COMPOSE) exec web python -m scripts.replay_fixture --url http://localhost:8000 --times 2 $(f)
 
 shell-web: ## Open a shell in the web container
 	$(COMPOSE) exec web bash
