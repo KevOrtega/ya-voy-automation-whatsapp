@@ -1,0 +1,137 @@
+# Development environment only. Production runs on Dokku (see docs/06-arquitectura.md §4).
+# Setup: cp .env.example .env, fill EVOLUTION_API_KEY and WEBHOOK_SECRET, then `docker compose up`.
+
+name: ya-voy
+
+x-app: &app
+  build:
+    context: .
+    args:
+      INSTALL_DEV: "true"
+  image: ya-voy-app:dev
+  env_file: .env
+  volumes:
+    - .:/app
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: yavoy
+      POSTGRES_PASSWORD: yavoy
+      POSTGRES_DB: yavoy
+      POSTGRES_EXTRA_DATABASES: evolution
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yavoy -d yavoy && psql -U yavoy -d evolution -c 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  evolution:
+    # Pinned on purpose: payload formats (@lid, reactions, deletes) change between releases.
+    image: evoapicloud/evolution-api:v2.3.7
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_TYPE: http
+      SERVER_PORT: 8080
+      SERVER_URL: ${EVOLUTION_SERVER_URL:-http://localhost:8080}
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY:?set EVOLUTION_API_KEY in .env}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      DEL_INSTANCE: "false"
+      LANGUAGE: en
+      LOG_LEVEL: ERROR,WARN,INFO,LOG,WEBHOOKS
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://yavoy:yavoy@postgres:5432/evolution?schema=evolution_api
+      DATABASE_CONNECTION_CLIENT_NAME: evolution_yavoy
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://redis:6379/1
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+      # The webhook is configured per instance (MESSAGES_UPSERT, CONNECTION_UPDATE) pointing at
+      # http://web:8000/webhooks/evolution/<WEBHOOK_SECRET>.
+      WEBHOOK_GLOBAL_ENABLED: "false"
+    volumes:
+      - evolution_instances:/evolution/instances
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  web:
+    <<: *app
+    command: ["uvicorn", "ya_voy.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: ["arq", "ya_voy.worker.WorkerSettings", "--watch", "ya_voy"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pg_data:
+  redis_data:
+  evolution_instances:
