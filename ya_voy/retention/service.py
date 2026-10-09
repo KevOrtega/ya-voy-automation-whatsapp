@@ -13,6 +13,15 @@ messages and events of those orders, unsent outbox rows, unfinished inbound even
 overrides that are pending or still in force, and report files whose report is not ``sent`` /
 ``failed`` or that a queued document still needs.
 
+Identities (``stores``, ``couriers``) with no activity inside the window are anonymized last:
+phone, name, every JID and the ``lid`` are cleared (the name becomes ``STORE_FALLBACK_NAME`` /
+``COURIER_FALLBACK_NAME``). "Activity" is any row that references the identity and is still not
+anonymized (rows inside the window never are; older ones only while a live flow guards them),
+plus the identity's own timestamps. ``ADMIN_PHONES`` and blocked identities are never anonymized.
+A later message from the same person finds no row (its identifiers are ``NULL``) and is
+registered as a new identity; old orders and reports keep pointing at the anonymized one. JIDs
+and phones in rows past the window are scrubbed too, except group JIDs and ``ADMIN_PHONES``.
+
 Runtime payload captures (``CAPTURE_DIR``, development only) older than the window are deleted from
 disk after the database work; missing files are fine. Committed fixtures
 (``tests/fixtures/evolution``) are already anonymized by ``scripts/anonymize_captures.py``.
@@ -26,7 +35,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import Text, bindparam, text
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ya_voy.config import Settings
@@ -34,6 +44,7 @@ from ya_voy.db.models import sql_in
 from ya_voy.domain.enums import PENDING_STATUSES
 from ya_voy.schedule import repository as schedule_repository
 from ya_voy.schedule.calendar import business_date
+from ya_voy.whatsapp.jids import jid_for_phone
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +53,65 @@ _PENDING_ORDER = "('draft', 'awaiting_confirmation', 'published')"
 _ORDER_IS_PENDING = (
     f"EXISTS (SELECT 1 FROM orders o WHERE o.id = t.order_id AND o.status IN {_PENDING_ORDER})"
 )
+
+
+_EMPTY = "''"  # NOT NULL text columns are emptied instead of nulled
+
+
+def _keep_jid(column: str) -> str:
+    """Group JIDs (not a person) and the admins' own JIDs survive; any other JID is personal."""
+    return f"({column} LIKE '%@g.us' OR {column} = ANY(:admin_jids))"
+
+
+def _scrub_jid(column: str, empty: str = "NULL") -> str:
+    return f"{column} = CASE WHEN {_keep_jid('t.' + column)} THEN t.{column} ELSE {empty} END"
+
+
+# Courier names inside a report revision become the fallback name (ids and statuses stay).
+_SNAPSHOT_NAMES = """(
+    SELECT COALESCE(jsonb_object_agg(e.key, e.value || CASE
+               WHEN e.value->>'courier_name' IS NULL THEN '{}'::jsonb
+               ELSE jsonb_build_object('courier_name', CAST(:courier_name AS text)) END),
+           '{}'::jsonb)
+      FROM jsonb_each(t.snapshot) e)"""
+_CHANGE_NAMES = """(
+    SELECT COALESCE(jsonb_agg(c.value
+               || CASE WHEN c.value->>'from' IS NULL THEN '{}'::jsonb
+                       ELSE jsonb_build_object('from', CAST(:courier_name AS text)) END
+               || CASE WHEN c.value->>'to' IS NULL THEN '{}'::jsonb
+                       ELSE jsonb_build_object('to', CAST(:courier_name AS text)) END
+               ORDER BY c.ordinality), '[]'::jsonb)
+      FROM jsonb_array_elements(t.changes) WITH ORDINALITY c)"""
+
+# An identity row is still referenced by live or recent data (docs/06, "activity").
+_NOT_ANONYMIZED = "x.anonymized_at IS NULL"
+_STORE_ACTIVE = f"""(
+    t.created_at >= :cutoff_ts
+    OR COALESCE(t.last_message_at >= :cutoff_ts, false)  -- NULL: never wrote
+    OR EXISTS (SELECT 1 FROM orders x WHERE x.store_id = t.id AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM messages x WHERE x.store_id = t.id AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM inbound_events x
+                WHERE x.remote_jid IN (t.wa_jid, t.lid) AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM outbound_messages x
+                WHERE x.recipient_jid IN (t.wa_jid, t.lid) AND {_NOT_ANONYMIZED}))"""
+_COURIER_ACTIVE = f"""(
+    t.first_seen_at >= :cutoff_ts
+    OR t.last_seen_at >= :cutoff_ts
+    OR EXISTS (SELECT 1 FROM orders x
+                WHERE (x.courier_id = t.id OR x.last_courier_id = t.id) AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM order_events x
+                WHERE (x.courier_id = t.id OR (x.actor_type = 'courier' AND x.actor_id = t.id))
+                  AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM messages x WHERE x.courier_id = t.id AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM parked_reactions x
+                WHERE x.courier_id = t.id
+                  AND (x.status = 'pending' OR x.created_at >= :cutoff_ts))
+    OR EXISTS (SELECT 1 FROM inbound_events x
+                WHERE (x.participant IN (t.lid, t.phone_jid)
+                       OR x.remote_jid IN (t.lid, t.phone_jid))
+                  AND {_NOT_ANONYMIZED})
+    OR EXISTS (SELECT 1 FROM outbound_messages x
+                WHERE x.recipient_jid IN (t.lid, t.phone_jid) AND {_NOT_ANONYMIZED}))"""
 
 
 @dataclass(frozen=True)
@@ -76,19 +146,22 @@ CATEGORIES: tuple[Category, ...] = (
         "inbound_events",
         "inbound_events",
         "t.received_at < :cutoff_ts AND t.status IN ('processed', 'ignored', 'failed')",
-        "payload = '{}'::jsonb, error = NULL",
+        f"""payload = '{{}}'::jsonb, error = NULL,
+            {_scrub_jid("remote_jid")}, {_scrub_jid("participant")}""",
     ),
     Category(
         "messages",
         "messages",
         f"t.created_at < :cutoff_ts AND (t.order_id IS NULL OR NOT {_ORDER_IS_PENDING})",
-        "body = NULL",
+        f"body = NULL, {_scrub_jid('chat_jid', _EMPTY)}, {_scrub_jid('sender_jid')}",
     ),
     Category(
         "outbound_messages",
         "outbound_messages",
         "t.created_at < :cutoff_ts AND t.status IN ('sent', 'failed')",
-        "body = '', last_error = NULL",
+        # Keys may embed a sender's JID (admin_rate_limited_sender); none is reused past the window.
+        f"""body = '', last_error = NULL, idempotency_key = 'anonymized:' || t.id,
+            {_scrub_jid("recipient_jid", _EMPTY)}""",
     ),
     Category(
         "schedule_overrides",
@@ -98,10 +171,12 @@ CATEGORIES: tuple[Category, ...] = (
             AND NOT (t.status = 'active'
                      AND (t.ends_at IS NULL OR t.ends_at >= :cutoff_ts)
                      AND (t.business_date IS NULL OR t.business_date >= :cutoff_date))""",
-        "source_text = '', parsed = '{}'::jsonb, reason = NULL",
+        """source_text = '', parsed = '{}'::jsonb, reason = NULL,
+           created_by = CASE WHEN t.created_by = ANY(:admin_phones)
+                             THEN t.created_by ELSE '' END""",
     ),
     Category(
-        "report_files",
+        "report_revisions",
         "report_revisions",
         """EXISTS (
                 SELECT 1 FROM daily_reports r
@@ -111,10 +186,29 @@ CATEGORIES: tuple[Category, ...] = (
             AND NOT EXISTS (
                 SELECT 1 FROM outbound_messages o
                  WHERE o.report_revision_id = t.id AND o.status IN ('pending', 'sending'))""",
-        # The .xlsx lists addresses. ``file_name`` is only "reporte-ya-voy-<date>.xlsx".
-        "file_content = NULL",
+        # The .xlsx lists addresses and phones. ``file_name`` is only "reporte-ya-voy-<date>.xlsx".
+        f"file_content = NULL, snapshot = {_SNAPSHOT_NAMES}, changes = {_CHANGE_NAMES}",
+    ),
+    # Identities last: they wait until every row referencing them was anonymized above.
+    Category(
+        "stores",
+        "stores",
+        f"""NOT t.is_blocked
+            AND NOT COALESCE(t.phone = ANY(:admin_phones) OR t.wa_jid = ANY(:admin_jids), false)
+            AND NOT {_STORE_ACTIVE}""",
+        "wa_jid = NULL, phone = NULL, lid = NULL, display_name = :store_name, updated_at = :now",
+    ),
+    Category(
+        "couriers",
+        "couriers",
+        f"""NOT t.is_blocked
+            AND NOT COALESCE(t.phone = ANY(:admin_phones) OR t.phone_jid = ANY(:admin_jids), false)
+            AND NOT {_COURIER_ACTIVE}""",
+        """lid = NULL, phone_jid = NULL, phone = NULL, display_name = :courier_name,
+           updated_at = :now""",
     ),
 )
+_ARRAYS = ("admin_phones", "admin_jids")
 
 # ``ya_voy.whatsapp.capture.capture_file_name``: ``20261009T031500123456Z_<event>_<hash>.json``.
 _CAPTURE_NAME = re.compile(r"^(\d{8}T\d{12})Z_.+\.json$")
@@ -151,18 +245,28 @@ def _batch_sql(category: Category) -> str:
     """
 
 
+def run_params(settings: Settings, limits: Cutoff) -> dict[str, object]:
+    return {
+        "now": limits.now,
+        "cutoff_ts": limits.ts,
+        "cutoff_date": limits.date,
+        "batch": settings.data_retention_batch_size,
+        "admin_phones": list(settings.admin_phones),
+        "admin_jids": [jid_for_phone(p) for p in settings.admin_phones],
+        "store_name": settings.store_fallback_name,
+        "courier_name": settings.courier_fallback_name,
+    }
+
+
 async def anonymize_batch(
-    session: AsyncSession, category: Category, limits: Cutoff, batch_size: int
+    session: AsyncSession, category: Category, params: dict[str, object]
 ) -> int:
-    rows = await session.execute(
-        text(_batch_sql(category)),
-        {
-            "now": limits.now,
-            "cutoff_ts": limits.ts,
-            "cutoff_date": limits.date,
-            "batch": batch_size,
-        },
+    sql = _batch_sql(category)
+    used = {k: v for k, v in params.items() if f":{k}" in sql}
+    statement = text(sql).bindparams(
+        *(bindparam(k, type_=ARRAY(Text)) for k in _ARRAYS if k in used)
     )
+    rows = await session.execute(statement, used)
     return len(rows.all())
 
 
@@ -174,10 +278,11 @@ async def anonymize_category(
 ) -> int:
     """Batches until one comes back short (done, or the rest is locked by someone else)."""
     total = 0
+    params = run_params(settings, limits)
     batch_size = settings.data_retention_batch_size
     while True:
         async with session_factory() as session, session.begin():
-            done = await anonymize_batch(session, category, limits, batch_size)
+            done = await anonymize_batch(session, category, params)
         total += done
         if done < batch_size:
             return total

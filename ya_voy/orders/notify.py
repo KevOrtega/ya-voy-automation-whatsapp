@@ -14,6 +14,7 @@ Keys:
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,8 @@ from ya_voy.db.models import Courier, Order, OrderEvent
 from ya_voy.db.queries import enqueue_outbound_message
 from ya_voy.domain.enums import ActorType, OrderEventType, OutboundMessageType
 from ya_voy.schedule import repository as schedule_repository
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,12 +45,11 @@ async def now(session: AsyncSession) -> dt.datetime:
     return await schedule_repository.db_now(session)
 
 
-def courier_jid(courier: Courier) -> str:
-    """Private chat of a courier. TODO(stage-5b): confirm with the real number that Evolution
-    delivers private messages to an ``@lid`` (couriers known only by ``lid``)."""
-    jid = courier.phone_jid or courier.lid
-    assert jid is not None  # CHECK couriers_has_identity
-    return jid
+def courier_jid(courier: Courier) -> str | None:
+    """Private chat of a courier; ``None`` once retention anonymized it (``Outbox.add`` skips it).
+    TODO(stage-5b): confirm with the real number that Evolution delivers private messages to an
+    ``@lid`` (couriers known only by ``lid``)."""
+    return courier.phone_jid or courier.lid
 
 
 def key(order_id: int, template_key: str, suffix: str) -> str:
@@ -94,7 +96,7 @@ class Outbox:
         self,
         idempotency_key: str,
         template_key: str,
-        recipient_jid: str,
+        recipient_jid: str | None,
         body: str = "",
         *,
         order_id: int | None = None,
@@ -102,6 +104,13 @@ class Outbox:
         target_wa_message_id: str | None = None,
         message_type: OutboundMessageType = OutboundMessageType.TEXT,
     ) -> int | None:
+        if recipient_jid is None:
+            # An identity anonymized by retention (RNF-10): nobody to write to any more.
+            logger.warning(
+                "outbound skipped: recipient anonymized",
+                extra={"template_key": template_key, "order_id": order_id},
+            )
+            return None
         new_id = await enqueue_outbound_message(
             self.session,
             idempotency_key=idempotency_key,

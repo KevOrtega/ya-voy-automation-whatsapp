@@ -46,6 +46,14 @@ PERSONAL_ORDER = {
     "validation_errors": [{"field": "payment_method"}],
 }
 JOEL_JID = "5491100000007@s.whatsapp.net"
+STORE_JID = "5491155550000@s.whatsapp.net"
+GROUP_JID = "120363000000000001@g.us"
+ADMIN_JID = "5491100000001@s.whatsapp.net"  # ADMIN_PHONES in the worker_ctx fixture
+SNAPSHOT = {"1": {"code": "YV-1", "status": "assigned", "courier_id": 7, "courier_name": "Joel"}}
+CHANGES = [
+    {"code": "YV-1", "type": "courier_changed", "from": "Joel", "to": "Pedro"},
+    {"code": "YV-2", "type": "added", "from": None, "to": "Ana"},
+]
 EVENT_DATA = {"extraction": EXTRACTION, "admin_jid": "5491100000001", "error": "x", "emoji": "👍"}
 CAPTURE_PAYLOAD = {"event": "messages.upsert", "data": {"pushName": "Joel", "text": "hola"}}
 
@@ -146,6 +154,7 @@ class Data:
                     status="processed",
                     received_at=created,
                     payload=CAPTURE_PAYLOAD,
+                    remote_jid=GROUP_JID,
                     participant=JOEL_JID,
                     error="boom with text",
                 ),
@@ -158,6 +167,8 @@ class Data:
                     order_id=order,
                     store_id=store,
                     inbound_event_id=inbound,
+                    chat_jid=STORE_JID,
+                    sender_jid=STORE_JID,
                 ),
             )
             await self.add(
@@ -169,6 +180,8 @@ class Data:
                     order_id=order,
                     last_error="earlier failure",
                     wa_message_id=f"WA-{age}",
+                    recipient_jid=STORE_JID,
+                    idempotency_key=f"admin_rate_limited_sender:{day}:{STORE_JID}",
                 ),
             )
             await self.add(
@@ -190,7 +203,8 @@ class Data:
                     status="sent",
                     file_name=f"reporte-ya-voy-{day}.xlsx",
                     file_content=b"PK xlsx with el ceibo 2871",
-                    snapshot={"1": {"code": f"YV-{age}"}},
+                    snapshot=SNAPSHOT,
+                    changes=CHANGES,
                     created_at=created,
                 ),
             )
@@ -235,7 +249,9 @@ async def test_personal_fields_past_the_window_are_redacted_and_rows_kept(
         "messages": 1,
         "outbound_messages": 1,
         "schedule_overrides": 1,
-        "report_files": 1,
+        "report_revisions": 1,
+        "stores": 0,  # both still active (docs/06): see test_retention_identities.py
+        "couriers": 0,
         "capture_files": 0,
     }
     assert await count_rows(engine) == before  # nothing deleted
@@ -279,6 +295,7 @@ async def test_personal_fields_past_the_window_are_redacted_and_rows_kept(
         "processed",
         NOW,
     )
+    assert (inbound.remote_jid, inbound.participant) == (GROUP_JID, None)  # the group stays
     assert inbound.wa_message_id  # the dedup key stays
     message = await get(sf, m.Message, data.ids["old_message"])
     assert (message.body, message.order_id, message.inbound_event_id, message.anonymized_at) == (
@@ -287,6 +304,7 @@ async def test_personal_fields_past_the_window_are_redacted_and_rows_kept(
         data.ids["old_inbound"],
         NOW,
     )
+    assert (message.chat_jid, message.sender_jid, message.store_id) == ("", None, data.ids["store"])
     outbound = await get(sf, m.OutboundMessage, data.ids["old_outbound"])
     assert (outbound.body, outbound.last_error, outbound.status, outbound.wa_message_id) == (
         "",
@@ -295,6 +313,10 @@ async def test_personal_fields_past_the_window_are_redacted_and_rows_kept(
         "WA-old",
     )
     assert outbound.anonymized_at == NOW
+    assert (outbound.recipient_jid, outbound.idempotency_key) == (
+        "",
+        f"anonymized:{outbound.id}",
+    )
     override = await get(sf, m.ScheduleOverride, data.ids["old_override"])
     assert (override.source_text, override.parsed, override.reason, override.status) == (
         "",
@@ -302,12 +324,15 @@ async def test_personal_fields_past_the_window_are_redacted_and_rows_kept(
         None,
         "expired",
     )
+    assert override.created_by == ""  # "5491100000000" is not in ADMIN_PHONES
     revision = await get(sf, m.ReportRevision, data.ids["old_revision"])
-    assert (revision.file_content, revision.anonymized_at, revision.snapshot) == (
-        None,
-        NOW,
-        {"1": {"code": "YV-old"}},
-    )
+    assert (revision.file_content, revision.anonymized_at) == (None, NOW)
+    # Courier names become the fallback name; codes, statuses and courier ids stay.
+    assert revision.snapshot == {"1": SNAPSHOT["1"] | {"courier_name": "Motero"}}
+    assert revision.changes == [
+        {"code": "YV-1", "type": "courier_changed", "from": "Motero", "to": "Motero"},
+        {"code": "YV-2", "type": "added", "from": None, "to": "Motero"},
+    ]
     assert revision.file_name == f"reporte-ya-voy-{OLD_DAY}.xlsx"
 
     # Inside the window: untouched, column by column.
@@ -539,8 +564,8 @@ async def test_batch_boundaries(
     sizes: list[int] = []
     original = service.anonymize_batch
 
-    async def spy(session: AsyncSession, category: Any, limits: Any, batch_size: int) -> int:
-        done = await original(session, category, limits, batch_size)
+    async def spy(session: AsyncSession, category: Any, params: dict[str, Any]) -> int:
+        done = await original(session, category, params)
         if category.name == "messages":
             sizes.append(done)
         return done
@@ -564,7 +589,13 @@ async def test_concurrent_runs_anonymize_each_row_once(
     before = await count_rows(engine)
     results = await asyncio.gather(*(run(ctx) for _ in range(4)))
     assert sum(r["messages"] for r in results) == 41
-    for name in ("orders", "order_events", "inbound_events", "outbound_messages", "report_files"):
+    for name in (
+        "orders",
+        "order_events",
+        "inbound_events",
+        "outbound_messages",
+        "report_revisions",
+    ):
         assert sum(r[name] for r in results) == 1, name
     assert await count_rows(engine) == before
     async with engine.connect() as conn:
