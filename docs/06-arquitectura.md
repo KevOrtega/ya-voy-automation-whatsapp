@@ -152,24 +152,54 @@ make reprocess ids=--all     # todos los eventos en failed
 
 #### Toma de pedidos (etapa 4a)
 
-`ya_voy/worker/intake.py` recibe el texto de un local ya identificado (`StoreText`) y hace T01, T02 y T05:
-bloquea el borrador abierto con `SELECT ... FOR UPDATE`, llama a `OrderExtractor`, une los campos (lo nuevo no
-vacío reemplaza; `payment_method` lo decide el diccionario de `ya_voy/domain/payment.py` cuando hay texto de
-pago) y renueva `draft_expires_at = now() + DRAFT_TTL_MINUTES`. Si el local no tiene borrador, lo crea con
-`INSERT ... ON CONFLICT DO NOTHING` sobre `orders_one_draft_per_store`; si otro mensaje simultáneo ganó, bloquea
-ese borrador y une ahí (RN-09, sin lock de Redis). Los comandos (`sí`, `no`, `cancelar`, `ayuda`) no pasan por
-el LLM. Si el LLM falla, el borrador queda igual y se envían `store_processing_error` y `admin_llm_failure`.
+`ya_voy/worker/intake.py` recibe el texto de un local ya identificado (`StoreText`) y hace T01, T02 y T05.
+La llamada al LLM nunca se hace con una conexión a la base tomada ni dentro de una transacción:
+
+1. Toma el lock de Redis del local (`lock:store:{store_id}`, `SET NX PX` con un token aleatorio). Si está
+   tomado, espera (sin conexión a la base) hasta un TTL. Así los mensajes de un mismo local se procesan de a
+   uno y en orden; los de locales distintos, en paralelo.
+2. Transacción corta: lee el borrador abierto y su revisión (`last_store_message_at`), renueva
+   `draft_expires_at` (para que `expire_drafts` no lo cierre mientras corre el LLM) y hace commit.
+3. Renueva el TTL del lock y llama a `OrderExtractor` sin conexión a la base.
+4. Transacción corta: bloquea el borrador (`SELECT ... FOR UPDATE`) y verifica que la revisión no cambió. Une
+   los campos (lo nuevo no vacío reemplaza; `payment_method` lo decide el diccionario de
+   `ya_voy/domain/payment.py` cuando hay texto de pago), renueva `draft_expires_at = now() + DRAFT_TTL_MINUTES`
+   y guarda el mensaje. Si el local no tenía borrador, lo crea con `INSERT ... ON CONFLICT DO NOTHING` sobre
+   `orders_one_draft_per_store` (RN-09).
+5. Libera el lock solo si el token sigue siendo el propio (script Lua: comparar y borrar).
+
+La verificación de revisión es un respaldo, no el camino normal: con el lock tomado nadie más escribe
+`last_store_message_at`. Solo si el lock se perdiera (por ejemplo, Redis reiniciado) la revisión cambia o el
+`INSERT` encuentra otro borrador; entonces vuelve al paso 2 con el borrador más reciente, hasta
+`MAX_APPLY_ATTEMPTS = 3` veces, y si sigue cambiando el evento falla (queda para `make reprocess`).
+
+**TTL del lock.** Se calcula con la configuración, no es una constante, y siempre es estrictamente mayor que
+el peor caso del LLM:
+
+```
+peor_caso = LLM_TIMEOUT_SECONDS × (LLM_MAX_RETRIES + 1) + 0,5 s × (2^LLM_MAX_RETRIES − 1)
+TTL       = peor_caso + max(15 s, 25 % de peor_caso)
+```
+
+El segundo término del peor caso es la suma de las esperas entre reintentos (0,5 s, 1 s, 2 s, ...). Con los
+valores por defecto (20 s, 3 reintentos): peor caso 83,5 s y TTL ≈ 104,4 s. El margen cubre las dos
+transacciones cortas y la latencia de Redis. Además, el TTL se renueva antes de cada llamada al LLM. Si el
+worker se cae, el TTL libera al local.
+
+Los comandos (`sí`, `no`, `cancelar`, `ayuda`) también toman el lock pero no pasan por el LLM. Si el LLM falla,
+el borrador queda igual y se envían `store_processing_error` y `admin_llm_failure`.
 
 Después del commit se encola `evaluate_draft(order_id)` diferido `DRAFT_DEBOUNCE_SECONDS` (RF-15). Si llegó otro
 mensaje en ese lapso, la evaluación se descarta (la del mensaje nuevo evalúa después). Con campos faltantes envía
 `store_order_missing_fields` (y `store_order_format_example` desde el pedido número `MAX_MISSING_FIELDS_PROMPTS`);
 completo, pasa a `awaiting_confirmation` (T04) y envía `store_order_confirm_request`. Las claves de la bandeja de
 salida incluyen la revisión del borrador (`last_store_message_at`), así que evaluar dos veces lo mismo no
-duplica mensajes. `expire_drafts` (T09) es un `UPDATE` condicional: un mensaje que renueva el borrador tiene el
-bloqueo de la fila y gana.
+duplica mensajes. `expire_drafts` (T09) es un `UPDATE` condicional sobre `draft_expires_at`: un borrador cuyo mensaje se está
+procesando ya fue renovado en el paso 2 y no vence.
 
 Pendiente para la etapa 4b (`TODO(stage-4b)`): clasificar al remitente y dar de alta locales (`identity`,
-`@lid`), conectar la ruta `private_text` con `drafts.handle_store_text`, los efectos de los comandos (T06-T08),
+`@lid`), conectar la ruta `private_text` con `drafts.handle_store_text` (fuera de la transacción que bloquea el
+evento entrante, marcándolo procesado con `finalize` en la transacción del paso 4), los efectos de los comandos (T06-T08),
 `store_help` con su espera, `store_unsupported_media` y el control de horario `is_accepting_orders` (RN-18).
 
 #### Política de reintentos de la bandeja de salida
@@ -307,9 +337,9 @@ Consideraciones:
 | `WEBHOOK_SECRET` | — | Secreto en la ruta del webhook. |
 | `COURIERS_GROUP_JID` | `1203630xxxxxxxx@g.us` | Grupo de moteros; cualquier otro grupo se ignora. |
 | `ADMIN_PHONES` | `5491100000000` | Número(s) del administrador, separados por coma: alertas, reporte, comandos y cambios de horario. |
-| `LLM_PROVIDER` | `openai` | Proveedor de LLM: `openai` (u `openai-compatible`, cualquier API compatible con Chat Completions de OpenAI y salida `json_schema`) o `fake` (solo desarrollo: extractor determinístico por etiquetas `Campo: valor`, sin red). |
-| `LLM_MODEL` | — | Modelo para extracción. Obligatorio con `openai`. |
-| `LLM_API_KEY` | — | Obligatorio con `openai`. Sin él el worker arranca igual, registra `LLM not configured` en `ERROR` y cada pedido recibe `store_processing_error` (y los administradores `admin_llm_failure`). Los tests nunca lo usan. |
+| `LLM_PROVIDER` | `openai` | Proveedor de LLM: `openai` (u `openai-compatible`, cualquier API compatible con Chat Completions de OpenAI y salida `json_schema`) o `fake` (solo desarrollo, rechazado en producción: extractor determinístico por etiquetas `Campo: valor`, sin red). |
+| `LLM_MODEL` | — | Modelo para extracción. Obligatorio en producción (`APP_ENV=production`): sin él la configuración no valida y el deploy falla. |
+| `LLM_API_KEY` | — | Obligatorio en producción, igual que `WEBHOOK_SECRET`: sin él la configuración no valida y el deploy falla. En desarrollo es opcional: el worker arranca igual, registra `LLM not configured` en `ERROR` y cada pedido recibe `store_processing_error` (y los administradores `admin_llm_failure`); o se usa `LLM_PROVIDER=fake`. Los tests nunca lo usan. |
 | `LLM_BASE_URL` | vacío | Para proveedores compatibles con OpenAI o modelos propios. |
 | `LLM_TIMEOUT_SECONDS` | `20` | |
 | `LLM_MAX_RETRIES` | `3` | |

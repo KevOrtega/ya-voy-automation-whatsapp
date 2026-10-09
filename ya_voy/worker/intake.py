@@ -4,22 +4,26 @@ Everything here works on a normalized message and a known ``Store`` row. Who the
 (admin / courier / store), store auto-registration and ``@lid`` handling are stage 4b
 (``ya_voy/identity``); see ``TODO(stage-4b)`` in ``ya_voy/worker/inbound.py``.
 
-Concurrency (RN-09, ``orders_one_draft_per_store``): the open draft is locked with
-``SELECT ... FOR UPDATE``; when there is none, the draft is created with
-``INSERT ... ON CONFLICT DO NOTHING`` on that partial unique index, and the loser of a concurrent
-insert locks the winner's row and merges into it. No Redis lock is needed for correctness.
+Concurrency: a store's messages are serialized by a per-store Redis lock whose TTL exceeds the
+worst-case LLM time (``ya_voy.locks``). The LLM runs with no database connection checked out,
+between a short snapshot transaction and a short apply transaction. The apply transaction locks the
+open draft (``SELECT ... FOR UPDATE``) and checks its revision (``last_store_message_at``); a
+mismatch, possible only if the lock was lost, re-reads and retries (bounded). Draft creation keeps
+``INSERT ... ON CONFLICT DO NOTHING`` on ``orders_one_draft_per_store`` (RN-09).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from redis.asyncio import Redis
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ya_voy.config import Settings
 from ya_voy.db.models import Message, Order, OrderEvent, Store
@@ -36,6 +40,8 @@ from ya_voy.domain.enums import (
 )
 from ya_voy.domain.orders import OrderFields, clean_extraction, merge, validate_required_fields
 from ya_voy.llm.extractor import LLMError, OrderExtractor
+from ya_voy.llm.schemas import OrderExtraction
+from ya_voy.locks import store_lock
 from ya_voy.messaging import catalog
 from ya_voy.messaging.outbox import enqueue_admin_alert
 from ya_voy.schedule.calendar import business_date
@@ -43,6 +49,8 @@ from ya_voy.schedule.calendar import business_date
 logger = logging.getLogger(__name__)
 
 _IN_PREPARATION = [str(s) for s in IN_PREPARATION_STATUSES]
+# Snapshot -> LLM -> apply rounds per message; more than one only if the store lock was lost.
+MAX_APPLY_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -178,51 +186,77 @@ async def _llm_failed(
     return IntakeResult("llm_failed", order_id=order_id, outbound_ids=ids)
 
 
-async def handle_store_text(
+@dataclass(frozen=True)
+class DraftSnapshot:
+    """What the LLM call is based on, read in a short transaction that is already closed."""
+
+    store_id: int
+    order_id: int | None
+    revision: dt.datetime | None
+    current: OrderExtraction | None
+
+
+class DraftChangedError(Exception):
+    """The draft kept changing under the extraction (lock lost repeatedly); event fails."""
+
+
+Finalize = Callable[[AsyncSession], Awaitable[None]]
+
+
+async def _read_snapshot(
+    session_factory: async_sessionmaker[AsyncSession], settings: Settings, store_id: int
+) -> DraftSnapshot:
+    """Short transaction: the open draft and its revision; also renews its expiry.
+
+    Renewing here (not after the LLM) keeps ``expire_drafts`` from closing a draft whose store
+    message is being extracted. The revision (``last_store_message_at``) is not touched.
+    """
+    async with session_factory() as session, session.begin():
+        if await session.get(Store, store_id) is None:
+            raise ValueError(f"store {store_id} does not exist")
+        draft = await _lock_open_draft(session, store_id)
+        if draft is None:
+            return DraftSnapshot(store_id, None, None, None)
+        now = await _now(session)
+        renewed = now + dt.timedelta(minutes=settings.draft_ttl_minutes)
+        if draft.draft_expires_at is None or draft.draft_expires_at < renewed:
+            draft.draft_expires_at = renewed
+        return DraftSnapshot(
+            store_id, draft.id, draft.last_store_message_at, fields_of(draft).as_extraction()
+        )
+
+
+async def _apply(
     session: AsyncSession,
     settings: Settings,
-    extractor: OrderExtractor,
+    store: Store,
     msg: StoreText,
-) -> IntakeResult:
-    """T01 / T02 / T05 for one text message. Call inside a transaction; commit, then enqueue.
-
-    TODO(stage-4b): ``is_accepting_orders(now)`` guard (RN-18, CU-10) before touching drafts.
-    """
-    store = await session.get(Store, msg.store_id)
-    if store is None:
-        raise ValueError(f"store {msg.store_id} does not exist")
-
-    command = parse_store_command(msg.text)
-    if command is not None:
-        # TODO(stage-4b): CONFIRM -> T06/T07, REJECT/CANCEL -> T08 (or CU-09 for published
-        # orders), HELP -> store_help. Commands never reach the LLM (CU-01 5a).
-        _record_message(session, store, msg, None)
-        return IntakeResult("command", command=command)
-
+    snapshot: DraftSnapshot,
+    extraction: OrderExtraction,
+) -> IntakeResult | None:
+    """T01 / T02 / T05 with the extraction; ``None`` if the draft changed since the snapshot."""
     now = await _now(session)
     draft = await _lock_open_draft(session, store.id)
-    current = fields_of(draft) if draft is not None else None
-    try:
-        extraction = await extractor.extract(
-            msg.text, current.as_extraction() if current is not None else None
-        )
-    except LLMError:
-        logger.warning("order extraction failed", extra={"store_id": store.id}, exc_info=True)
-        _record_message(session, store, msg, draft.id if draft else None)
-        return await _llm_failed(session, settings, store, msg, draft.id if draft else None)
-
     created = False
-    if draft is None:
+    if snapshot.order_id is None:
+        if draft is not None:
+            return None
         if clean_extraction(extraction).is_empty:
             # CU-01 6b: nothing to start a draft with.
             # TODO(stage-4b): store_help at most once per HELP_REPLY_COOLDOWN_MINUTES.
             _record_message(session, store, msg, None)
             return IntakeResult("no_order_data")
-        new_id = await _create_draft(session, settings, store.id, now)
-        created = new_id is not None
-        # Lock our new row, or the concurrent winner's once it commits.
+        if await _create_draft(session, settings, store.id, now) is None:
+            return None  # another transaction created it (RN-09): re-read and retry
+        created = True
         draft = await _lock_open_draft(session, store.id)
         assert draft is not None, "the draft must exist after the insert"
+    elif (
+        draft is None
+        or draft.id != snapshot.order_id
+        or draft.last_store_message_at != snapshot.revision
+    ):
+        return None
 
     from_status = draft.status
     merged = merge(fields_of(draft), extraction)
@@ -256,6 +290,76 @@ async def handle_store_text(
     )
     _record_message(session, store, msg, draft.id)
     return IntakeResult(outcome, order_id=draft.id, evaluate=True)
+
+
+async def handle_store_text(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis: Redis,
+    settings: Settings,
+    extractor: OrderExtractor,
+    msg: StoreText,
+    *,
+    finalize: Finalize | None = None,
+) -> IntakeResult:
+    """T01 / T02 / T05 for one text message; commits on its own, then the caller enqueues.
+
+    Holds the store's Redis lock (``ya_voy.locks``) for the whole message, but no database
+    connection while the LLM runs: snapshot transaction, LLM call, apply transaction. The apply
+    step checks the draft revision and, if it changed (only possible if the lock was lost),
+    retries from a fresh snapshot up to ``MAX_APPLY_ATTEMPTS`` times. ``finalize`` runs inside
+    the transaction that records the outcome (stage 4b marks the inbound event processed there).
+
+    TODO(stage-4b): ``is_accepting_orders(now)`` guard (RN-18, CU-10) before touching drafts.
+    """
+    async with store_lock(redis, settings, msg.store_id) as lock:
+        command = parse_store_command(msg.text)
+        if command is not None:
+            # TODO(stage-4b): CONFIRM -> T06/T07, REJECT/CANCEL -> T08 (or CU-09 for published
+            # orders), HELP -> store_help. Commands never reach the LLM (CU-01 5a).
+            async with session_factory() as session, session.begin():
+                store = await _get_store(session, msg.store_id)
+                _record_message(session, store, msg, None)
+                if finalize is not None:
+                    await finalize(session)
+            return IntakeResult("command", command=command)
+
+        for attempt in range(1, MAX_APPLY_ATTEMPTS + 1):
+            snapshot = await _read_snapshot(session_factory, settings, msg.store_id)
+            await lock.refresh()
+            try:
+                # No database connection is held here (RNF: pool sized for short transactions).
+                extraction = await extractor.extract(msg.text, snapshot.current)
+            except LLMError:
+                logger.warning(
+                    "order extraction failed", extra={"store_id": msg.store_id}, exc_info=True
+                )
+                async with session_factory() as session, session.begin():
+                    store = await _get_store(session, msg.store_id)
+                    _record_message(session, store, msg, snapshot.order_id)
+                    result = await _llm_failed(session, settings, store, msg, snapshot.order_id)
+                    if finalize is not None:
+                        await finalize(session)
+                return result
+
+            async with session_factory() as session, session.begin():
+                store = await _get_store(session, msg.store_id)
+                result = await _apply(session, settings, store, msg, snapshot, extraction)
+                if result is not None:
+                    if finalize is not None:
+                        await finalize(session)
+                    return result
+            logger.warning(
+                "draft changed during extraction, retrying",
+                extra={"store_id": msg.store_id, "attempt": attempt},
+            )
+    raise DraftChangedError(f"store {msg.store_id}: draft changed {MAX_APPLY_ATTEMPTS} times")
+
+
+async def _get_store(session: AsyncSession, store_id: int) -> Store:
+    store = await session.get(Store, store_id)
+    if store is None:
+        raise ValueError(f"store {store_id} does not exist")
+    return store
 
 
 @dataclass

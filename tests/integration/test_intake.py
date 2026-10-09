@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import time
 from collections.abc import Callable
 from typing import Any
 
 import pytest
-from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from tests.integration import factories as f
 from tests.integration.conftest import queued
@@ -20,6 +21,7 @@ from tests.llm_stubs import CANONICAL_ORDER_TEXT, StubExtractor
 from ya_voy.db.models import Message, Order, OrderEvent, OutboundMessage, Store
 from ya_voy.domain.commands import StoreCommand
 from ya_voy.llm.schemas import OrderExtraction
+from ya_voy.locks import store_lock_key
 from ya_voy.messaging import catalog
 from ya_voy.queue import EVALUATE_DRAFT, SEND_OUTBOUND
 from ya_voy.worker import drafts, intake
@@ -67,10 +69,7 @@ async def new_store(session_factory: SF, name: str = "Casa Nogal") -> Store:
 
 
 async def send(ctx: dict[str, Any], store: Store, text: str, **kw: Any) -> intake.IntakeResult:
-    async with ctx["session_factory"]() as session, session.begin():
-        return await drafts.handle_store_text(
-            ctx, session, StoreText(store_id=store.id, text=text, **kw)
-        )
+    return await drafts.handle_store_text(ctx, StoreText(store_id=store.id, text=text, **kw))
 
 
 async def evaluate(ctx: dict[str, Any], order_id: int) -> intake.EvaluationResult:
@@ -438,7 +437,7 @@ async def test_expired_drafts_are_closed_and_the_store_told(
 async def test_message_renewing_a_draft_wins_over_a_concurrent_expiry(
     ctx: dict[str, Any],
 ) -> None:
-    """The store message holds the row lock; the expiry UPDATE re-checks and skips the row."""
+    """Reading the snapshot renews the expiry, so a sweep during the LLM call skips the draft."""
     store = await new_store(ctx["session_factory"])
     first = await send(ctx, store, WITHOUT_PAYMENT)
     await expire_now(ctx["session_factory"], first.order_id)
@@ -455,3 +454,195 @@ async def test_message_renewing_a_draft_wins_over_a_concurrent_expiry(
     order = await get_order(ctx["session_factory"], first.order_id)
     assert (order.status, order.payment_method) == ("draft", "cash")
     assert await outbox(ctx["session_factory"], first.order_id) == []
+
+
+# --- Redis store lock: no DB connection during the LLM call (docs/06) --------------------------
+
+
+class PoolProbe(StubExtractor):
+    """Sleeps like a slow LLM and tracks concurrency."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__(ANSWERS, delay=delay)
+        self.running = 0
+        self.max_running = 0
+
+    async def extract(self, text: str, current: OrderExtraction | None = None) -> OrderExtraction:
+        self.running += 1
+        self.max_running = max(self.max_running, self.running)
+        try:
+            return await super().extract(text, current)
+        finally:
+            self.running -= 1
+
+
+async def test_slow_llm_does_not_hold_pool_connections(worker_ctx: Ctx, database_url: str) -> None:
+    small = create_async_engine(database_url, pool_size=2, max_overflow=0, pool_timeout=2)
+    try:
+        ctx = worker_ctx(draft_debounce_seconds=0)
+        ctx["session_factory"] = async_sessionmaker(small, expire_on_commit=False)
+        probe = PoolProbe(delay=3.0)
+        ctx["order_extractor"] = probe
+        stores = [await new_store(ctx["session_factory"], f"Local {i}") for i in range(6)]
+
+        async def other_db_work() -> tuple[int, float]:
+            await asyncio.sleep(1.0)  # every store is inside its LLM call by now
+            checked_out = small.pool.checkedout()
+            started = time.monotonic()
+
+            async def query() -> None:
+                async with ctx["session_factory"]() as session:
+                    assert await session.scalar(text("SELECT 1")) == 1
+
+            await asyncio.gather(*(query() for _ in range(10)))
+            return checked_out, time.monotonic() - started
+
+        started = time.monotonic()
+        *results, (checked_out, other_elapsed) = await asyncio.gather(
+            *(send(ctx, store, CANONICAL_ORDER_TEXT) for store in stores), other_db_work()
+        )
+        elapsed = time.monotonic() - started
+
+        assert [r.outcome for r in results] == ["draft_created"] * 6
+        assert probe.max_running == 6  # 6 LLM calls at once with a pool of 2
+        assert checked_out == 0  # no connection checked out while the LLM runs
+        assert other_elapsed < 1.0  # other DB work proceeds during the LLM calls
+        assert elapsed < 3.0 * 2  # stores ran in parallel; nobody waited for a connection
+    finally:
+        await small.dispose()
+
+
+async def test_one_store_is_serialized_by_the_lock(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+    probe = PoolProbe(delay=0.3)
+    ctx["order_extractor"] = probe
+
+    first, second = await asyncio.gather(
+        send(ctx, store, WITHOUT_PAYMENT), send(ctx, store, PAYMENT_ONLY)
+    )
+
+    assert probe.max_running == 1
+    # The later message saw the earlier one's draft as context.
+    assert probe.calls[0][1] is None
+    assert probe.calls[1][1] is not None
+    assert sorted([first.outcome, second.outcome]) == ["draft_created", "draft_updated"]
+    order = await get_order(ctx["session_factory"], first.order_id)
+    assert (order.product, order.payment_method) == ("almacen", "cash")
+    assert await ctx["redis"].get(store_lock_key(store.id)) is None
+
+
+async def test_waits_for_a_held_store_lock(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+    await ctx["redis"].set(store_lock_key(store.id), "other-worker", px=60_000)
+
+    async def release_later() -> None:
+        await asyncio.sleep(0.4)
+        await ctx["redis"].delete(store_lock_key(store.id))
+
+    started = time.monotonic()
+    result, _ = await asyncio.gather(send(ctx, store, CANONICAL_ORDER_TEXT), release_later())
+
+    assert result.outcome == "draft_created"
+    assert time.monotonic() - started >= 0.4
+
+
+async def test_lock_released_after_llm_failure(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+    ctx["order_extractor"] = StubExtractor(fail=True)
+    assert (await send(ctx, store, CANONICAL_ORDER_TEXT)).outcome == "llm_failed"
+    assert await ctx["redis"].get(store_lock_key(store.id)) is None
+
+
+class Meddler(StubExtractor):
+    """Changes the draft behind the lock's back during the first ``times`` calls."""
+
+    def __init__(self, session_factory: SF, store: Store, times: int) -> None:
+        super().__init__(ANSWERS)
+        self.session_factory = session_factory
+        self.store = store
+        self.times = times
+
+    async def extract(self, text: str, current: OrderExtraction | None = None) -> OrderExtraction:
+        result = await super().extract(text, current)
+        if len(self.calls) <= self.times:
+            async with self.session_factory() as session, session.begin():
+                await session.execute(
+                    update(Order)
+                    .where(Order.store_id == self.store.id, Order.status == "draft")
+                    .values(
+                        product=f"meddled {len(self.calls)}",
+                        last_store_message_at=func.clock_timestamp(),
+                    )
+                )
+        return result
+
+
+async def test_revision_changed_retries_with_the_latest_draft(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+    first = await send(ctx, store, WITHOUT_PAYMENT)
+    meddler = Meddler(ctx["session_factory"], store, times=1)
+    ctx["order_extractor"] = meddler
+
+    result = await send(ctx, store, PAYMENT_ONLY)
+
+    assert (result.outcome, result.order_id) == ("draft_updated", first.order_id)
+    assert len(meddler.calls) == 2
+    assert meddler.calls[1][1].product == "meddled 1"  # re-read the latest draft
+    order = await get_order(ctx["session_factory"], first.order_id)
+    assert (order.product, order.payment_method) == ("meddled 1", "cash")
+    assert (await events(ctx["session_factory"], order.id)).count("draft_updated") == 1
+
+
+async def test_revision_retries_are_bounded(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+    await send(ctx, store, WITHOUT_PAYMENT)
+    meddler = Meddler(ctx["session_factory"], store, times=99)
+    ctx["order_extractor"] = meddler
+
+    with pytest.raises(intake.DraftChangedError):
+        await send(ctx, store, PAYMENT_ONLY)
+    assert len(meddler.calls) == intake.MAX_APPLY_ATTEMPTS
+    assert await ctx["redis"].get(store_lock_key(store.id)) is None
+
+
+async def test_draft_created_elsewhere_during_extraction_is_merged(ctx: dict[str, Any]) -> None:
+    store = await new_store(ctx["session_factory"])
+
+    class CreatesDraft(StubExtractor):
+        async def extract(self, t: str, current: OrderExtraction | None = None) -> OrderExtraction:
+            result = await super().extract(t, current)
+            if len(self.calls) == 1:
+                async with ctx["session_factory"]() as session, session.begin():
+                    await f.insert_row(
+                        await session.connection(),
+                        f.order(store.id, product="otro", last_store_message_at=f.NOW),
+                    )
+            return result
+
+    ctx["order_extractor"] = CreatesDraft(ANSWERS)
+    result = await send(ctx, store, PAYMENT_ONLY)
+
+    assert result.outcome == "draft_updated"
+    [order] = await store_orders(ctx["session_factory"], store)
+    assert (order.id, order.product, order.payment_method) == (result.order_id, "otro", "cash")
+
+
+async def test_concurrent_creation_keeps_one_draft_without_the_lock(ctx: dict[str, Any]) -> None:
+    """RN-09 fallback: two apply transactions that both saw no draft create exactly one."""
+    store = await new_store(ctx["session_factory"])
+    snapshot = intake.DraftSnapshot(store.id, None, None, None)
+    extraction = ANSWERS[WITHOUT_PAYMENT]
+
+    async def apply(i: int) -> intake.IntakeResult | None:
+        async with ctx["session_factory"]() as session, session.begin():
+            row = await session.get(Store, store.id)
+            assert row is not None
+            msg = StoreText(store_id=store.id, text=WITHOUT_PAYMENT, wa_message_id=f"W{i}")
+            result = await intake._apply(session, ctx["settings"], row, msg, snapshot, extraction)
+            await asyncio.sleep(0.2)  # keep the winner's insert uncommitted for a while
+            return result
+
+    results = await asyncio.gather(*(apply(i) for i in range(4)))
+
+    assert sum(r is not None for r in results) == 1  # the others must re-read and retry
+    assert len(await store_orders(ctx["session_factory"], store)) == 1

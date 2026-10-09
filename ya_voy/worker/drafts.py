@@ -38,14 +38,16 @@ async def expire_drafts(ctx: dict[str, Any]) -> int:
 
 
 async def handle_store_text(
-    ctx: dict[str, Any], session: AsyncSession, msg: intake.StoreText
+    ctx: dict[str, Any], msg: intake.StoreText, *, finalize: intake.Finalize | None = None
 ) -> intake.IntakeResult:
-    """Entry point for stage 4b: run inside the inbound event's transaction.
-
-    The caller commits, then calls :func:`after_commit` with the result.
+    """Entry point for stage 4b. Call it outside any open transaction (it commits on its own);
+    pass ``finalize`` to mark the inbound event processed atomically with the outcome. Then call
+    :func:`after_commit` with the result.
     """
     extractor: OrderExtractor = ctx["order_extractor"]
-    return await intake.handle_store_text(session, ctx["settings"], extractor, msg)
+    return await intake.handle_store_text(
+        ctx["session_factory"], ctx["redis"], ctx["settings"], extractor, msg, finalize=finalize
+    )
 
 
 async def after_commit(ctx: dict[str, Any], result: intake.IntakeResult) -> None:

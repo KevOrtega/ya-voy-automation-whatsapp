@@ -46,14 +46,19 @@ sequenceDiagram
         W->>DB: INSERT messages, INSERT outbound_messages (store_out_of_hours o store_closed_*) si no hubo uno reciente
         W->>EVO: sendText al local
     else dentro del horario efectivo
-        W->>Q: acquire lock store:{store_id}
-        W->>DB: SELECT draft FOR UPDATE, INSERT orders (status = 'draft') si no existe
-        W->>DB: INSERT messages (direction = 'in')
+        W->>Q: SET lock:store:{store_id} token NX PX TTL (TTL > peor caso del LLM)
+        W->>DB: transacción corta: SELECT draft FOR UPDATE, revisión = last_store_message_at, renovar draft_expires_at, COMMIT
+        Note over W,LLM: sin conexión a la base durante la llamada
         W->>LLM: extract(text, current_draft) -> OrderExtraction
         LLM-->>W: pickup_address, delivery_address, product
-        W->>DB: UPDATE orders SET merged fields, draft_expires_at, last_store_message_at
+        W->>DB: transacción corta: SELECT draft FOR UPDATE, ¿misma revisión?
+        alt misma revisión (camino normal)
+            W->>DB: INSERT orders ON CONFLICT DO NOTHING si no había borrador, UPDATE orders (merge, draft_expires_at, last_store_message_at), INSERT messages, COMMIT
+        else cambió (solo si se perdió el lock)
+            W->>W: volver a leer el borrador y reintentar (máximo 3)
+        end
         W->>Q: enqueue evaluate_draft(order_id) defer DRAFT_DEBOUNCE_SECONDS
-        W->>Q: release lock
+        W->>Q: release lock (solo si el token es el propio)
     end
 
     Q->>W: evaluate_draft(order_id)

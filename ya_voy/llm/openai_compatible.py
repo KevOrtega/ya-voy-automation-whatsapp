@@ -20,6 +20,7 @@ from ya_voy.llm.extractor import LLMError
 from ya_voy.llm.schemas import OrderExtraction
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_BACKOFF_BASE_SECONDS = 0.5
 RETRYABLE_STATUS = frozenset({408, 429})
 
 SYSTEM_PROMPT = """\
@@ -78,7 +79,7 @@ class OpenAICompatibleExtractor:
         base_url: str | None = None,
         timeout: float = 20,
         max_retries: int = 3,
-        backoff_base_seconds: float = 0.5,
+        backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.model = model
@@ -100,6 +101,16 @@ class OpenAICompatibleExtractor:
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
         )
+
+    @staticmethod
+    def worst_case_seconds(
+        timeout: float,
+        max_retries: int,
+        backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
+    ) -> float:
+        """Longest :meth:`extract` can take: every attempt times out, plus every backoff."""
+        total_backoff = backoff_base_seconds * (2**max_retries - 1)
+        return timeout * (max_retries + 1) + total_backoff
 
     async def aclose(self) -> None:
         await self._http.aclose()
