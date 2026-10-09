@@ -82,7 +82,7 @@ def test_pending_reminder() -> None:
         "*cancelar YV-0057*."
     )
     assert texts.pending_reminder(D, ["YV-0130"], correction=True).startswith(
-        "⏳ La corrección del reporte del 09/10/2026 está listo"
+        "⏳ La corrección del reporte del 09/10/2026 está lista"
     )
 
 

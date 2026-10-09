@@ -137,7 +137,7 @@ TEMPLATES: dict[str, str] = {
         "Totales actualizados: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados. Este archivo reemplaza a la versión anterior."
     ),
     ADMIN_REPORT_PENDING_REMINDER: (
-        "⏳ {report_label} del {report_date} está listo, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. "
+        "⏳ {report_label} del {report_date} {ready_label}, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. "
         "Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*."
     ),
     ADMIN_DAILY_REPORT_FAILED: (
@@ -202,6 +202,8 @@ SCHEDULE_INVALID_REASONS: dict[str, str] = {
 # Daily report (doc 07 "Alertas y reporte", "Textos de cambios"; sheets and columns from doc 05).
 REPORT_LABEL_INITIAL = "El reporte"
 REPORT_LABEL_CORRECTION = "La corrección del reporte"
+READY_LABEL_INITIAL = "está listo"
+READY_LABEL_CORRECTION = "está lista"
 SCHEDULE_NOTE = "\nCambios de horario: {items}"
 CHANGE_LINES: dict[str, str] = {
     "added": "• Pedido agregado *{code}* (tomado por {to_courier})",
