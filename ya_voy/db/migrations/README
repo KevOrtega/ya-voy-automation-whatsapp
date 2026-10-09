@@ -1,0 +1,4 @@
+Async Alembic migrations. The URL is taken from DATABASE_URL via ya_voy.config.
+
+  alembic revision --autogenerate -m "create orders table"
+  alembic upgrade head
