@@ -27,15 +27,36 @@ that govern your task before writing code.
 
 ## Commands
 
-Not defined yet: stage 1 (dev environment and skeleton) adds them and must update this section.
-Expected shape, to be replaced with the real commands:
+Defined in stage 1 (`Makefile`, `docker-compose.yml`). Run from the repo root.
 
 ```bash
-docker compose up -d                 # postgres, redis, evolution, web, worker
-docker compose run --rm migrate      # alembic upgrade head
-pytest                               # full suite (needs compose postgres/redis)
-ruff check . && ruff format --check .
+# One-time setup
+make env                  # .env from .env.example with random EVOLUTION_API_KEY / WEBHOOK_SECRET
+make venv                 # .venv with the app + dev deps (pip install -e ".[dev]")
+
+# Stack (development only)
+make up                   # docker compose up -d --build: postgres, redis, evolution, migrate, web, worker
+make ps                   # all healthy; migrate "Exited (0)"
+curl localhost:8000/health   # {"status":"ok","checks":{"database":"ok","redis":"ok"}}
+make logs                 # follow web + worker (JSON logs)
+make down                 # stop, keep volumes (make clean = down -v, also wipes the WhatsApp session)
+
+# Tests and lint
+make test                 # pytest locally; unit tests only, integration tests are skipped
+make test-docker          # full suite in Docker incl. integration tests against compose Postgres/Redis
+make lint                 # ruff check . && ruff format --check .
+make format               # ruff check --fix . && ruff format .
+
+# Migrations (Alembic, async; URL from DATABASE_URL)
+make revision m="create orders table"   # alembic revision --autogenerate (in Docker)
+make migrate                            # docker compose run --rm migrate (alembic upgrade head)
+docker compose run --rm migrate alembic downgrade -1
 ```
+
+Layout: `ya_voy/` package (`api/`, `worker/`, `db/` with `migrations/`, `config.py`, `queue.py`,
+`logging.py`), `tests/`. Integration tests are marked `integration` and run only with
+`RUN_INTEGRATION=1` (set by `make test-docker`). Ports: web 8000, Evolution 8080 (manager at
+`/manager`), Postgres 5432 (`yavoy`/`yavoy`, DBs `yavoy` and `evolution`), Redis 6379.
 
 ## Workflow
 
