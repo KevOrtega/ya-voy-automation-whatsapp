@@ -96,9 +96,13 @@ def _fk(target: str, *, nullable: bool = True) -> Any:
 
 class Store(Base):
     __tablename__ = "stores"
+    __table_args__ = (
+        # Only an anonymized store (retention, RNF-10) has no JID; UNIQUE allows many NULLs.
+        CheckConstraint("anonymized_at IS NOT NULL OR wa_jid IS NOT NULL", name="has_identity"),
+    )
 
     id: Mapped[int] = _pk()
-    wa_jid: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    wa_jid: Mapped[str | None] = mapped_column(Text, unique=True)
     phone: Mapped[str | None] = mapped_column(Text, unique=True)
     lid: Mapped[str | None] = mapped_column(Text, unique=True)
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
@@ -107,12 +111,17 @@ class Store(Base):
     out_of_hours_replied_at: Mapped[dt.datetime | None] = _ts()
     created_at: Mapped[dt.datetime] = _ts_now()
     updated_at: Mapped[dt.datetime] = _ts_now(onupdate=True)
+    anonymized_at: Mapped[dt.datetime | None] = _ts()  # identifiers cleared by retention
 
 
 class Courier(Base):
     __tablename__ = "couriers"
     __table_args__ = (
-        CheckConstraint("lid IS NOT NULL OR phone_jid IS NOT NULL", name="has_identity"),
+        # Only an anonymized courier (retention, RNF-10) has no identifier.
+        CheckConstraint(
+            "anonymized_at IS NOT NULL OR lid IS NOT NULL OR phone_jid IS NOT NULL",
+            name="has_identity",
+        ),
     )
 
     id: Mapped[int] = _pk()
@@ -124,6 +133,7 @@ class Courier(Base):
     first_seen_at: Mapped[dt.datetime] = _ts_now()
     last_seen_at: Mapped[dt.datetime] = _ts_now()
     updated_at: Mapped[dt.datetime] = _ts_now(onupdate=True)
+    anonymized_at: Mapped[dt.datetime | None] = _ts()  # identifiers cleared by retention
 
 
 class Order(Base):

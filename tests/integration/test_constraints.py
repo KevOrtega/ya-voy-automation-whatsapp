@@ -46,9 +46,13 @@ async def test_store_nullable_identifiers_allow_many_nulls(engine: AsyncEngine) 
     await f.insert_ok(engine, f.store(phone=None, lid=None))
 
 
-@pytest.mark.parametrize("column", ["wa_jid", "display_name"])
-async def test_store_required_columns(engine: AsyncEngine, column: str) -> None:
-    await f.assert_rejected(engine, f.store(**{column: None}), f'column "{column}"')
+async def test_store_display_name_is_required(engine: AsyncEngine) -> None:
+    await f.assert_rejected(engine, f.store(display_name=None), 'column "display_name"')
+
+
+async def test_store_needs_wa_jid_unless_anonymized(engine: AsyncEngine) -> None:
+    await f.assert_rejected(engine, f.store(wa_jid=None), "stores_has_identity")
+    await f.insert_ok(engine, f.store(wa_jid=None, anonymized_at=f.NOW))
 
 
 # --- couriers -----------------------------------------------------------------------------
