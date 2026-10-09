@@ -1,15 +1,18 @@
-"""Declarative base shared by all models (tables are added in stage 2)."""
+"""Declarative base shared by all models."""
 
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
 
-# Deterministic constraint names so Alembic autogenerate produces stable migrations.
+# Deterministic names that mirror PostgreSQL's own defaults (orders_pkey, stores_wa_jid_key,
+# orders_store_id_fkey, ...). CHECK constraints are named "<table>_<name>", so the constraints that
+# docs/05 names explicitly keep their exact names (e.g. "courier_matches_status" ->
+# "orders_courier_matches_status"). Indexes are always named explicitly in the models.
 NAMING_CONVENTION = {
-    "ix": "ix_%(column_0_label)s",
-    "uq": "uq_%(table_name)s_%(column_0_N_name)s",
-    "ck": "ck_%(table_name)s_%(constraint_name)s",
-    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-    "pk": "pk_%(table_name)s",
+    "ix": "%(table_name)s_%(column_0_N_name)s_idx",
+    "uq": "%(table_name)s_%(column_0_N_name)s_key",
+    "ck": "%(table_name)s_%(constraint_name)s",
+    "fk": "%(table_name)s_%(column_0_name)s_fkey",
+    "pk": "%(table_name)s_pkey",
 }
 
 
