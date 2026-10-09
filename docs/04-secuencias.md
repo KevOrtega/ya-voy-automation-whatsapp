@@ -10,9 +10,9 @@ Participantes comunes:
 - **DB**: PostgreSQL.
 - **LLM**: proveedor de LLM para extracción estructurada.
 
-## 1. Recepción, alta automática del local y validación del pedido
+## 1. Recepción, alta automática del local, validación y confirmación del pedido
 
-Caso: un local nuevo manda el ejemplo canónico sin la línea de pago y lo completa en un segundo mensaje.
+Caso: un local nuevo manda el ejemplo canónico sin la línea de pago, lo completa en un segundo mensaje y confirma el resumen.
 
 ```mermaid
 sequenceDiagram
@@ -77,23 +77,43 @@ sequenceDiagram
 
     Q->>W: evaluate_draft(order_id)
     W->>W: validate_required_fields() OK
-    rect rgb(235, 245, 255)
-        Note over W,DB: Una transacción
-        W->>DB: UPDATE orders SET status = 'published', code, published_at, unclaimed_alert_at WHERE status = 'draft'
-        W->>DB: INSERT order_events (published)
-        W->>DB: INSERT outbound_messages (group_order_post, store_order_published)
-    end
-    W->>EVO: sendText al grupo de moteros
-    EVO-->>W: key.id del mensaje publicado
-    W->>DB: UPDATE orders SET group_message_id = key.id
+    W->>DB: UPDATE orders SET status = 'awaiting_confirmation', confirmation_requested_at WHERE status = 'draft'
+    W->>DB: INSERT outbound_messages (store_order_confirm_request)
     W->>EVO: sendText al local
-    EVO->>S: "Pedido YV-0042 publicado"
+    EVO->>S: "Revisá tu pedido: ... ¿Confirmás el pedido? Respondé SÍ para enviarlo o corregí lo que haga falta"
+
+    S->>EVO: "sí"
+    EVO->>API: POST /webhooks/evolution/{secret}
+    API->>DB: INSERT inbound_events
+    API->>Q: enqueue process_inbound_event
+    API-->>EVO: 200 OK
+    Q->>W: process_inbound_event
+    Note over W: "sí" es un comando: no se llama al LLM
+    W->>DB: is_accepting_orders(now)
+    alt dentro del horario efectivo
+        rect rgb(235, 245, 255)
+            Note over W,DB: Una transacción
+            W->>DB: UPDATE orders SET status = 'published', code, confirmed_at, published_at, unclaimed_alert_at WHERE status = 'awaiting_confirmation'
+            W->>DB: INSERT order_events (confirmed, published)
+            W->>DB: INSERT outbound_messages (group_order_post, store_order_published)
+        end
+        W->>EVO: sendText al grupo de moteros
+        EVO-->>W: key.id del mensaje publicado
+        W->>DB: UPDATE orders SET group_message_id = key.id
+        W->>EVO: sendText al local
+        EVO->>S: "Pedido YV-0042 enviado a los moteros"
+    else fuera del horario efectivo
+        W->>EVO: store_order_not_sent_closed
+        EVO->>S: "No pude enviar tu pedido: hoy no tomamos pedidos por lluvia"
+    end
 ```
 
 Puntos clave:
 
 - El webhook nunca llama al LLM ni a Evolution: solo persiste y encola (RNF-01).
 - La extracción del LLM recibe el borrador actual como contexto, pero la combinación y la validación las hace el código.
+- Nada se publica sin el "sí" del local sobre el resumen vigente; si en lugar de "sí" el local manda una corrección,
+  el pedido vuelve a `draft`, se combina y se reenvía el resumen (T05).
 - El intervalo de agrupación (`DRAFT_DEBOUNCE_SECONDS`) evita responder "faltan datos" a cada mensaje de una ráfaga.
 - `group_message_id` se guarda cuando Evolution devuelve el `key.id`; sin ese id no se pueden asociar las
   reacciones, por eso la publicación en el grupo se envía antes que la confirmación al local.
@@ -217,10 +237,69 @@ sequenceDiagram
     AD->>EVO: "cancelar YV-0042" (por privado al bot)
     EVO->>CR: (vía webhook y cola) admin_cancel
     CR->>DB: UPDATE orders SET status = 'cancelled', cancelled_by = 'admin'
-    CR->>EVO: store_order_cancelled_by_admin, group_order_cancelled, admin_command_ok
+    CR->>EVO: group_order_delete (eliminar la publicación para todos)
+    EVO->>G: (la publicación de YV-0042 desaparece)
+    CR->>EVO: admin_command_ok y store_order_cancelled_by_admin
 ```
 
-## 5. Reporte diario (con espera de pedidos pendientes)
+## 5. Cancelación con carrera contra una toma
+
+Caso: el local cancela YV-0042 en el mismo instante en que Emiliano reacciona. Se muestran los dos órdenes posibles.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor S as Local
+    actor C as Motero (Emiliano)
+    participant EVO as Evolution API
+    participant W1 as Worker (cancelación)
+    participant W2 as Worker (toma)
+    participant DB as PostgreSQL
+    participant G as Grupo de moteros
+
+    Note over S,G: Las llamadas al webhook y la cola se omiten por claridad
+    S->>EVO: "cancelar" (citando la confirmación de YV-0042)
+    C->>G: reacciona 👍 a la publicación de YV-0042
+    EVO->>W1: store_cancel
+    EVO->>W2: reaction_added
+
+    alt la cancelación toma el lock primero
+        W1->>DB: SELECT status FROM orders FOR UPDATE (published)
+        W2->>DB: UPDATE orders SET courier_id ... WHERE status = 'published' (espera el lock)
+        W1->>DB: UPDATE orders SET status = 'cancelled' WHERE status = 'published'
+        W1->>DB: INSERT outbound_messages (group_order_delete, store_order_cancelled)
+        W1->>DB: COMMIT
+        DB-->>W2: 0 filas (status = 'cancelled')
+        W2->>DB: INSERT order_events (reaction_on_cancelled)
+        W2->>EVO: courier_order_no_longer_available (si NOTIFY_REACTION_ON_CANCELLED)
+        EVO->>C: "El pedido YV-0042 fue cancelado"
+    else la toma se confirma primero
+        W2->>DB: UPDATE orders SET courier_id = Emiliano, status = 'assigned' WHERE status = 'published'
+        W2->>DB: INSERT outbound_messages (courier_order_assigned, store_order_assigned, group_order_assigned)
+        W2->>DB: COMMIT
+        W1->>DB: SELECT status, courier_id FROM orders FOR UPDATE (assigned, Emiliano)
+        W1->>DB: UPDATE orders SET status = 'cancelled', courier_id = NULL WHERE status = 'assigned'
+        W1->>DB: INSERT outbound_messages (courier_order_cancelled, group_order_delete x2, store_order_cancelled)
+        W1->>DB: COMMIT
+        Note over EVO,C: Envíos FIFO por destinatario: primero la asignación, después la cancelación
+        EVO->>C: "Te asignamos el pedido YV-0042 ..."
+        EVO->>C: "Tu pedido YV-0042 ha sido cancelado: retiro, entrega, producto, abona"
+    end
+
+    W1->>EVO: DELETE /chat/deleteMessageForEveryone (publicación y respuestas del bot)
+    alt eliminado
+        EVO-->>W1: OK
+        W1->>DB: INSERT order_events (group_post_deleted)
+    else falla
+        EVO-->>W1: error
+        W1->>EVO: editar mensaje a "CANCELADO — Pedido YV-0042" (o responder citándolo)
+        W1->>DB: INSERT order_events (group_post_delete_failed)
+    end
+    W1->>EVO: store_order_cancelled
+    EVO->>S: "Pedido YV-0042 cancelado"
+```
+
+## 6. Reporte diario (con espera de pendientes y corrección)
 
 ```mermaid
 sequenceDiagram
@@ -231,35 +310,47 @@ sequenceDiagram
     participant EVO as Evolution API
     actor AD as Administrador
 
-    Note over CR: Desde DAILY_REPORT_TIME (23:00) de la fecha D,<br/>cada SCHEDULER_INTERVAL_SECONDS
-    CR->>DB: INSERT daily_reports (report_date = D, status = 'waiting') ON CONFLICT DO NOTHING
-    CR->>DB: SELECT daily_reports WHERE report_date = D AND status = 'waiting' FOR UPDATE SKIP LOCKED
-    CR->>DB: SELECT count, codes FROM orders WHERE fecha local de created_at = D AND status IN ('draft', 'published')
-
-    alt hay pedidos pendientes
-        CR->>DB: UPDATE daily_reports SET pending_orders_count, last_checked_at
-        opt ya pasó REPORT_PENDING_REMINDER_TIME (01:00 de D+1) y pending_reminder_sent_at IS NULL
-            CR->>DB: UPDATE daily_reports SET pending_reminder_sent_at = now()
-            CR->>EVO: admin_report_pending_reminder (códigos pendientes)
-            EVO->>AD: "El reporte del 09/10 espera: YV-0057, YV-0058 sin tomar"
+    Note over CR: Cada SCHEDULER_INTERVAL_SECONDS
+    CR->>CR: due = report_due_at(D) (cierre efectivo, 23:00 o fin de la apertura extra)
+    opt now >= due
+        CR->>DB: INSERT daily_reports (report_date = D, status = 'waiting') ON CONFLICT DO NOTHING
+        CR->>DB: SELECT daily_reports WHERE report_date = D FOR UPDATE SKIP LOCKED
+        CR->>DB: SELECT pendientes FROM orders WHERE business_date = D AND status IN ('draft', 'awaiting_confirmation', 'published')
+        alt hay pendientes
+            CR->>DB: UPDATE daily_reports SET pending_orders_count, last_checked_at
+            opt now >= due + REPORT_PENDING_REMINDER_MINUTES y sin recordatorio
+                CR->>EVO: admin_report_pending_reminder (códigos)
+                EVO->>AD: "El reporte del 09/10 espera: YV-0057 sin tomar"
+            end
+        else sin pendientes
+            CR->>DB: INSERT report_revisions (revision = 1, kind = 'initial', snapshot)
+            CR->>X: build_daily_report(summary_rows, order_rows)
+            X-->>CR: bytes del .xlsx
+            CR->>DB: UPDATE report_revisions SET file_content, status = 'generated'
+            CR->>DB: INSERT outbound_messages (admin_daily_report, document, daily_report:D:v1:phone)
+            CR->>EVO: POST /message/sendMedia
+            EVO->>AD: documento + "Reporte del 09/10"
+            CR->>DB: UPDATE daily_reports SET status = 'sent', current_revision = 1
         end
-        Note over CR,AD: El administrador toma o cancela los pendientes.<br/>La próxima verificación vuelve a evaluar
-    else sin pendientes
-        CR->>DB: UPDATE daily_reports SET status = 'generating'
-        CR->>DB: Resumen: order_events de los pedidos de D agrupados por courier_id
-        CR->>DB: Pedidos: orders de D + stores + couriers
-        CR->>X: build_daily_report(summary_rows, order_rows)
-        X-->>CR: bytes del .xlsx
-        CR->>DB: UPDATE daily_reports SET file_content, status = 'generated'
-        CR->>DB: INSERT outbound_messages (admin_daily_report, document) por cada ADMIN_PHONES, idempotency_key daily_report:D:phone
-        CR->>EVO: POST /message/sendMedia (document, reporte-ya-voy-AAAA-MM-DD.xlsx)
-        EVO->>AD: documento + "Reporte del 09/10"
-        EVO-->>CR: key.id
-        CR->>DB: UPDATE outbound_messages SET status = 'sent', UPDATE daily_reports SET status = 'sent', sent_at
     end
+
+    Note over CR,AD: 23:40 Joel quita su reacción a YV-0123 (pedido del 09/10)
+    CR->>DB: (en la transacción de la liberación) UPDATE daily_reports SET status = 'correction_pending' WHERE status = 'sent'
+    Note over CR,AD: 23:45 Emiliano toma YV-0123
+    CR->>DB: SELECT daily_reports WHERE status = 'correction_pending' FOR UPDATE SKIP LOCKED
+    CR->>DB: ¿pendientes de D? No
+    CR->>DB: comparar pedidos de D con snapshot de la revisión 1
+    DB-->>CR: YV-0123 courier Joel pasa a Emiliano
+    CR->>DB: INSERT report_revisions (revision = 2, kind = 'correction', changes, snapshot)
+    CR->>X: build_daily_report(..., changes)
+    X-->>CR: bytes del .xlsx (con hoja Correcciones)
+    CR->>DB: INSERT outbound_messages (admin_daily_report_correction, daily_report:D:v2:phone)
+    CR->>EVO: POST /message/sendMedia
+    EVO->>AD: "Corrección del reporte del 09/10 (versión 2): el pedido YV-0123 pasó de Joel a Emiliano"
+    CR->>DB: UPDATE daily_reports SET status = 'sent', current_revision = 2
 ```
 
-## 6. Cambio de horario por el administrador (con confirmación)
+## 7. Cambio de horario por el administrador (con confirmación)
 
 ```mermaid
 sequenceDiagram
@@ -309,6 +400,7 @@ sequenceDiagram
     W->>EVO: store_closed_today (si no se le respondió hace poco)
     EVO->>S: "Hoy no tomamos pedidos por lluvia."
 
+    Note over AD,S: Las aperturas siguen el mismo flujo. "hoy hasta las 00" genera kind = open_window<br/>(23:00 a 24:00) y corre la hora del reporte del día a las 24:00
     AD->>EVO: "ya tomamos pedidos de nuevo"
     W->>LLM: parse_schedule(...)
     LLM-->>W: kind = reopen
@@ -322,7 +414,7 @@ sequenceDiagram
     W->>EVO: admin_schedule_applied
 ```
 
-## 7. Envío de mensajes salientes (bandeja de salida)
+## 8. Envío de mensajes salientes (bandeja de salida)
 
 Todos los envíos siguen el mismo patrón, que no se repite en los diagramas anteriores:
 
@@ -330,7 +422,9 @@ Todos los envíos siguen el mismo patrón, que no se repite en los diagramas ant
    `idempotency_key` determinística (por ejemplo `order:42:claimed:courier:7`). Si ya existe, no se inserta.
 2. Después del `COMMIT`, se encola `send_outbound(id)`.
 3. `send_outbound` toma la fila con `FOR UPDATE SKIP LOCKED`, respeta el límite de envío
-   (`OUTBOUND_MIN_INTERVAL_MS`, lock global en Redis), llama a Evolution (`sendText` o `sendMedia` según
-   `message_type`) y guarda `wa_message_id` y `status = 'sent'`.
+   (`OUTBOUND_MIN_INTERVAL_MS`, lock global en Redis) y el orden por destinatario (no envía una fila si hay
+   otra anterior pendiente para el mismo `recipient_jid`), llama a Evolution según `message_type`
+   (`text` → `sendText`, `document` → `sendMedia`, `delete` → `deleteMessageForEveryone`, `edit` → `updateMessage`)
+   y guarda `wa_message_id` y `status = 'sent'`.
 4. Ante error, reintenta con backoff hasta `OUTBOUND_MAX_ATTEMPTS`; luego `status = 'failed'` y alerta al administrador.
 5. Una tarea de barrido reencola filas `pending` antiguas (por si se perdió el trabajo en Redis).

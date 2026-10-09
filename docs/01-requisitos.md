@@ -6,20 +6,21 @@ Ya Voy automatiza la operación de un despachante de envíos que hoy coordina to
 los locales mandan pedidos, alguien los revisa y los reenvía a un grupo de moteros, y el motero
 que lo toma avisa. El sistema reemplaza esa intermediación manual por un bot que:
 
-1. Recibe pedidos por chat privado en un número de WhatsApp dedicado, dentro del horario de operación.
+1. Recibe pedidos por chat privado en un número de WhatsApp dedicado, dentro del horario efectivo.
 2. Extrae los datos del pedido y valida que estén completos.
 3. Pide al local los datos faltantes, admitiendo que el pedido llegue en varios mensajes.
-4. Publica el pedido completo en el grupo de moteros.
+4. Muestra al local un resumen del pedido completo y lo publica en el grupo de moteros solo cuando el local lo confirma.
 5. Asigna el pedido al primer motero que reacciona a la publicación, con garantía de un único ganador.
    Un pedido tomado se da por resuelto: no hay seguimiento de la entrega.
-6. Notifica a cada parte (local, motero, grupo, administrador) en cada cambio relevante.
-7. Permite al administrador cerrar o reabrir la toma de pedidos del día escribiendo en lenguaje natural.
-8. Envía al administrador un reporte diario en Excel cuando todos los pedidos del día están resueltos.
+6. Permite cancelar pedidos (local o administrador), retirando la publicación del grupo y avisando al motero si ya lo había tomado.
+7. Notifica a cada parte (local, motero, grupo, administrador) en cada cambio relevante.
+8. Permite al administrador cerrar, reabrir o extender la toma de pedidos escribiendo en lenguaje natural.
+9. Envía al administrador un reporte diario en Excel al cierre efectivo del día, cuando todos los pedidos están
+   resueltos, y reportes de corrección si algo cambia después.
 
 **Fuera de alcance de la primera versión (v1):** seguimiento de retiro o entrega, cobro o liquidación a
 moteros, cálculo de tarifas, seguimiento GPS, panel web, alta manual de locales o moteros, republicación
-automática de pedidos, ampliación del horario base, integración con la API oficial de WhatsApp (Cloud API)
-y procesamiento de audios o imágenes.
+automática de pedidos, integración con la API oficial de WhatsApp (Cloud API) y procesamiento de audios o imágenes.
 
 ## 2. Actores
 
@@ -27,8 +28,8 @@ y procesamiento de audios o imágenes.
 |-------|---------------|-------------|
 | Local | `store` | Cualquier número que escribe al bot por privado y no es administrador ni motero conocido. Se da de alta automáticamente en su primer mensaje, con el nombre de perfil de WhatsApp (`pushName`). |
 | Motero | `courier` | Participante del grupo de moteros. Se da de alta automáticamente la primera vez que reacciona a una publicación. Se identifica por su id de participante de WhatsApp (`@lid` o número). El administrador también puede tomar pedidos como motero. |
-| Administrador | `admin` | El cliente (jefe de los moteros). Su número está en `ADMIN_PHONES`. Recibe alertas y el reporte diario, interviene pedidos con comandos y modifica el horario del día. |
-| Sistema | `system` | El bot: API, worker y tareas programadas (vencimientos, alertas, reporte diario). |
+| Administrador | `admin` | El cliente (jefe de los moteros). Su número está en `ADMIN_PHONES`. Recibe alertas y reportes, interviene pedidos con comandos y modifica el horario del día. |
+| Sistema | `system` | El bot: API, worker y tareas programadas (vencimientos, alertas, reportes). |
 | Servicios externos | — | Evolution API (pasarela de WhatsApp) y el proveedor de LLM. No son actores de negocio, pero aparecen en las secuencias. |
 
 ## 3. Requisitos funcionales
@@ -49,78 +50,88 @@ y procesamiento de audios o imágenes.
 | ID | Requisito |
 |----|-----------|
 | RF-07 | El horario base es de `BUSINESS_HOURS_START` (09:00) a `BUSINESS_HOURS_END` (23:00) en la zona `TZ` (`America/Argentina/Buenos_Aires`). |
-| RF-08 | El horario efectivo es el horario base menos los cierres activos cargados por el administrador (`schedule_overrides`). |
-| RF-09 | Fuera del horario efectivo, los mensajes de un local que no sean comandos reciben una respuesta (como máximo una cada `OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES`) y no crean ni modifican borradores ni pedidos. Si el cierre se debe a un cierre del administrador, la respuesta indica el tipo de cierre y el motivo cuando se informó ("Hoy no tomamos pedidos por lluvia"). |
-| RF-10 | Las reacciones, liberaciones, cancelaciones, comandos del administrador y tareas programadas funcionan a cualquier hora. |
+| RF-08 | El horario efectivo de un día operativo es el horario base, más las aperturas extra (`open_window`) y menos los cierres (`closed_today`, `closed_until_further_notice`, `closed_window`) que el administrador tenga activos. Si una apertura y un cierre se superponen, gana el cierre. |
+| RF-09 | El día operativo (`business_date`) va desde `BUSINESS_DAY_ROLLOVER_TIME` (05:00) hasta la misma hora del día siguiente, para que una extensión después de medianoche (por ejemplo, hasta las 01:00) siga perteneciendo al mismo día. |
+| RF-10 | Fuera del horario efectivo, los mensajes de un local que no sean comandos reciben una respuesta (como máximo una cada `OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES`) y no crean ni modifican borradores ni pedidos. Si el cierre se debe a un cierre del administrador, la respuesta indica el tipo de cierre y el motivo cuando se informó ("Hoy no tomamos pedidos por lluvia"). |
+| RF-11 | Las reacciones, liberaciones, cancelaciones, comandos del administrador y tareas programadas funcionan a cualquier hora. |
 
-### Carga y validación de pedidos
+### Carga, validación y confirmación de pedidos
 
 | ID | Requisito |
 |----|-----------|
-| RF-11 | Por cada mensaje de texto de un local, el sistema extrae los datos del pedido mediante un LLM a un esquema estructurado (`OrderExtraction`). |
-| RF-12 | La validación de campos obligatorios se hace con código determinístico, no con el LLM. |
-| RF-13 | Si el local no tiene un borrador abierto, el mensaje crea uno. Si tiene uno, los datos extraídos se combinan con el borrador (los valores nuevos no vacíos reemplazan a los anteriores). |
-| RF-14 | El sistema espera un breve intervalo sin mensajes nuevos del local (`DRAFT_DEBOUNCE_SECONDS`) antes de evaluar el borrador y responder, para no contestar a cada mensaje de una ráfaga. |
-| RF-15 | Si el borrador está incompleto, el sistema responde al local indicando exactamente qué campos faltan. |
-| RF-16 | Si el borrador está completo, el sistema lo publica en el grupo de moteros (un único mensaje por pedido) y confirma al local con un código de pedido y un resumen. |
-| RF-17 | Un borrador sin actividad durante `DRAFT_TTL_MINUTES` (30) vence; el sistema avisa al local. |
-| RF-18 | El local puede descartar el borrador en curso con el comando `cancelar`. |
+| RF-12 | Por cada mensaje de texto de un local, el sistema extrae los datos del pedido mediante un LLM a un esquema estructurado (`OrderExtraction`). |
+| RF-13 | La validación de campos obligatorios se hace con código determinístico, no con el LLM. |
+| RF-14 | Si el local no tiene un borrador abierto, el mensaje crea uno. Si tiene uno, los datos extraídos se combinan con el borrador (los valores nuevos no vacíos reemplazan a los anteriores). |
+| RF-15 | El sistema espera un breve intervalo sin mensajes nuevos del local (`DRAFT_DEBOUNCE_SECONDS`) antes de evaluar el borrador y responder, para no contestar a cada mensaje de una ráfaga. |
+| RF-16 | Si el borrador está incompleto, el sistema responde al local indicando exactamente qué campos faltan. |
+| RF-17 | Si el borrador está completo, el sistema le envía al local un resumen completo del pedido y le pide confirmación ("¿Confirmás el pedido? Respondé SÍ para enviarlo o corregí lo que haga falta"). El pedido pasa a `awaiting_confirmation`. |
+| RF-18 | Si el local confirma (`sí`) dentro del horario efectivo, el pedido se publica en el grupo de moteros (un único mensaje por pedido) y se le confirma al local con el código de pedido. Si confirma fuera del horario efectivo, no se publica: recibe la respuesta de cierre y el pedido vence solo. |
+| RF-19 | Si en lugar de confirmar el local envía correcciones, se extraen y combinan con el pedido, se vuelve a validar y se le reenvía el resumen para confirmar. |
+| RF-20 | Si el local responde `no` o `cancelar` mientras el pedido espera confirmación, el pedido se descarta. |
+| RF-21 | Un borrador o un pedido esperando confirmación sin actividad durante `DRAFT_TTL_MINUTES` (30) vence; el sistema avisa al local. |
 
 ### Asignación (toma) y liberación
 
 | ID | Requisito |
 |----|-----------|
-| RF-19 | Cualquier participante del grupo de moteros (incluido el administrador) que reacciona con cualquier emoji a una publicación de pedido es un motero. Si no existe, se crea automáticamente (`couriers`) con su id de participante (`@lid` o JID de número), su número cuando se puede resolver (`participantAlt`, `senderPn` u otros campos alternativos que entregue Evolution) y su `pushName`. Los datos se completan y el nombre se actualiza en eventos posteriores. |
-| RF-20 | La asignación es atómica en la base de datos: si varios moteros reaccionan casi al mismo tiempo, gana exactamente uno. |
-| RF-21 | Al ganador se le envía un mensaje privado con la confirmación y el detalle del pedido, sin datos de contacto del local. |
-| RF-22 | Al local se le informa solo el nombre visible del motero ("Tu motero para este pedido será Emiliano"), sin su número. |
-| RF-23 | Se responde en el grupo, citando la publicación, "Asignado a {motero}". |
-| RF-24 | La reacción de un motero que no ganó no cambia la asignación; se le avisa por privado que el pedido ya fue tomado (`NOTIFY_LOSER_ON_RACE`, activo por defecto). |
-| RF-25 | Si el motero asignado quita su reacción, el pedido se libera y vuelve a estar disponible; se notifica al local y al grupo. |
-| RF-26 | Quitar una reacción solo libera el pedido si quien la quita es el motero asignado. |
-| RF-27 | Cambiar de emoji no libera ni reasigna el pedido. |
-| RF-28 | Un pedido asignado se considera resuelto y se cuenta como tomado. No hay confirmación de retiro ni de entrega. |
+| RF-22 | Cualquier participante del grupo de moteros (incluido el administrador) que reacciona con cualquier emoji a una publicación de pedido es un motero. Si no existe, se crea automáticamente (`couriers`) con su id de participante (`@lid` o JID de número), su número cuando se puede resolver (`participantAlt`, `senderPn` u otros campos alternativos que entregue Evolution) y su `pushName`. Los datos se completan y el nombre se actualiza en eventos posteriores. |
+| RF-23 | La asignación es atómica en la base de datos: si varios moteros reaccionan casi al mismo tiempo, gana exactamente uno. |
+| RF-24 | Al ganador se le envía un mensaje privado con la confirmación y el detalle del pedido, sin datos de contacto del local. |
+| RF-25 | Al local se le informa solo el nombre visible del motero ("Tu motero para este pedido será Emiliano"), sin su número. |
+| RF-26 | Se responde en el grupo, citando la publicación, "Asignado a {motero}". |
+| RF-27 | La reacción de un motero que no ganó no cambia la asignación; se le avisa por privado que el pedido ya fue tomado (`NOTIFY_LOSER_ON_RACE`, activo por defecto). |
+| RF-28 | Si el motero asignado quita su reacción, el pedido se libera y vuelve a estar disponible; se notifica al local y al grupo. |
+| RF-29 | Quitar una reacción solo libera el pedido si quien la quita es el motero asignado. |
+| RF-30 | Cambiar de emoji no libera ni reasigna el pedido. |
+| RF-31 | Un pedido asignado se considera resuelto y se cuenta como tomado. No hay confirmación de retiro ni de entrega. |
+| RF-32 | Una reacción a la publicación de un pedido cancelado (o a un mensaje ya eliminado) se ignora; si `NOTIFY_REACTION_ON_CANCELLED=true` (por defecto) se le avisa al motero, una vez por pedido, que el pedido fue cancelado. |
 
 ### Pedidos sin tomar y cancelación
 
 | ID | Requisito |
 |----|-----------|
-| RF-29 | El sistema no republica pedidos. Si un pedido publicado no es tomado en `UNCLAIMED_ALERT_MINUTES` (20), se alerta una sola vez al administrador; el pedido sigue publicado y se puede tomar. Si el pedido se libera, el plazo vuelve a empezar y puede generar una nueva alerta. |
-| RF-30 | El local puede cancelar un pedido publicado o asignado con `cancelar {código}` o respondiendo (citando) el mensaje de confirmación con `cancelar`. |
-| RF-31 | Al cancelarse un pedido publicado, se avisa en el grupo; si estaba asignado, también al motero por privado. |
+| RF-33 | El sistema no republica pedidos. Si un pedido publicado no es tomado en `UNCLAIMED_ALERT_MINUTES` (20), se alerta una sola vez al administrador; el pedido sigue publicado y se puede tomar. Si el pedido se libera, el plazo vuelve a empezar y puede generar una nueva alerta. |
+| RF-34 | El local cancela un pedido respondiendo `cancelar` citando el mensaje del pedido, o con `cancelar {código}`, o solo `cancelar` si tiene un único pedido activo. El administrador cancela con `cancelar {código}`. |
+| RF-35 | Al cancelarse un pedido publicado sin tomar, el bot elimina su publicación del grupo (borrar para todos) y confirma la cancelación a quien la pidió; si la pidió el administrador, también avisa al local. |
+| RF-36 | Al cancelarse un pedido ya tomado, además se le envía al motero por privado "Tu pedido {código} ha sido cancelado" con el detalle (retiro, entrega, producto, medio de pago), y se eliminan del grupo la publicación y las respuestas del bot sobre ese pedido. |
+| RF-37 | Si no se puede eliminar un mensaje del grupo, se edita para marcarlo como CANCELADO y, si tampoco se puede, se responde citándolo con "CANCELADO". El fallo se registra. |
+| RF-38 | La cancelación y la toma simultáneas se resuelven con la misma técnica que la doble reacción: transiciones condicionales sobre la fila del pedido; gana la primera que se confirma en la base y la otra no tiene efecto (o se procesa sobre el estado resultante). |
 
-### Administración
-
-| ID | Requisito |
-|----|-----------|
-| RF-32 | El administrador interviene pedidos escribiendo al bot por privado: `cancelar {código}` y `liberar {código}`. Cada intervención genera las mismas notificaciones que la acción equivalente del local o del motero. |
-| RF-33 | El administrador consulta el estado del día con `estado` u `horario`: horario base, cierres activos y futuros, si se están tomando pedidos, pedidos sin tomar y conteos del día. |
-| RF-34 | El administrador puede modificar el horario escribiendo en lenguaje natural ("hoy no tomamos pedidos por lluvia", "hoy no tomamos pedidos hasta nuevo aviso", "de 15 a 18 no tomaremos pedidos hoy", "ya tomamos pedidos de nuevo"). Un LLM interpreta el mensaje a un esquema estructurado (`ScheduleOverrideIntent`) con tipo `closed_today`, `closed_until_further_notice`, `closed_window` (fecha, inicio, fin) o `reopen`, y motivo opcional. La validación del resultado es determinística. |
-| RF-35 | Antes de aplicar un cambio de horario, el bot responde con un resumen en español claro y pide confirmación (`sí` / `no`). Solo se aplica si el administrador confirma dentro de `SCHEDULE_CONFIRMATION_TTL_MINUTES` (5); si no, la solicitud vence sin efecto. |
-| RF-36 | `reopen` levanta los cierres que están en vigor al momento de confirmar; los cierres futuros del día se mantienen y se informan en el resumen. |
-| RF-37 | Si hay un cierre "hasta nuevo aviso" activo, al comenzar el horario base de cada día se le recuerda al administrador (`admin_schedule_still_closed`). |
-| RF-38 | No hay alta, baja ni modificación manual de locales o moteros. El bloqueo (`is_blocked`) se hace directamente en la base en v1. |
-
-### Reporte diario
+### Administración y horario
 
 | ID | Requisito |
 |----|-----------|
-| RF-39 | A partir de `DAILY_REPORT_TIME` (23:00 en `TZ`) el worker prepara el reporte del día: un archivo `.xlsx` que se envía como documento de WhatsApp a cada número de `ADMIN_PHONES`. |
-| RF-40 | El reporte no se envía mientras haya pedidos del día pendientes (`published` sin tomar, o borradores aún abiertos). El worker vuelve a verificar periódicamente y lo envía en cuanto todos están tomados, cancelados o vencidos. |
-| RF-41 | Si a `REPORT_PENDING_REMINDER_TIME` (01:00 del día siguiente) siguen quedando pedidos pendientes, se le recuerda una vez al administrador, con sus códigos, que los tome o cancele. |
-| RF-42 | La hoja `Resumen` tiene una fila por motero con actividad en los pedidos del día: nombre, teléfono (si se conoce), cantidad de pedidos tomados, liberados y cancelados después de asignados. |
-| RF-43 | La hoja `Pedidos` tiene una fila por pedido publicado del día: código, horas de creación y asignación (en hora de Buenos Aires), nombre del local, dirección de retiro, dirección de entrega, producto, medio de pago, nombre del motero y estado. |
-| RF-44 | El reporte de una fecha se envía una sola vez por destinatario, aunque el worker se reinicie o la tarea se ejecute más de una vez. Si el worker estuvo caído, el reporte se procesa en cuanto vuelve. |
+| RF-39 | El administrador interviene pedidos escribiendo al bot por privado: `cancelar {código}` y `liberar {código}`. Cada intervención genera las mismas notificaciones que la acción equivalente del local o del motero, y además se avisa al local. |
+| RF-40 | El administrador consulta el estado del día con `estado` u `horario`: horario efectivo (base, aperturas y cierres), si se están tomando pedidos, pedidos sin tomar, conteos del día y hora prevista del reporte. |
+| RF-41 | El administrador puede modificar el horario escribiendo en lenguaje natural ("hoy no tomamos pedidos por lluvia", "hoy no tomamos pedidos hasta nuevo aviso", "de 15 a 18 no tomaremos pedidos hoy", "hoy hasta las 00", "ya tomamos pedidos de nuevo"). Un LLM interpreta el mensaje a un esquema estructurado (`ScheduleOverrideIntent`) con tipo `closed_today`, `closed_until_further_notice`, `closed_window`, `open_window` o `reopen`, y motivo opcional. La validación del resultado es determinística. |
+| RF-42 | Las aperturas extra (`open_window`) deben quedar dentro de los límites `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del día siguiente), deben agregar tiempo fuera del horario base y solo pueden cargarse para un día cuyo reporte original todavía no se generó. |
+| RF-43 | Antes de aplicar un cambio de horario, el bot responde con un resumen en español claro y pide confirmación (`sí` / `no`). Solo se aplica si el administrador confirma dentro de `SCHEDULE_CONFIRMATION_TTL_MINUTES` (5); si no, la solicitud vence sin efecto. |
+| RF-44 | `reopen` levanta los cierres que están en vigor al momento de confirmar; los cierres futuros y las aperturas se mantienen y se informan en el resumen. |
+| RF-45 | Si hay un cierre "hasta nuevo aviso" activo, al comenzar el horario base de cada día se le recuerda al administrador (`admin_schedule_still_closed`). |
+| RF-46 | Los cierres y aperturas no se anuncian en el grupo de moteros ni a los locales por iniciativa del bot. |
+| RF-47 | No hay alta, baja ni modificación manual de locales o moteros. El bloqueo (`is_blocked`) se hace directamente en la base en v1. |
+
+### Reporte diario y correcciones
+
+| ID | Requisito |
+|----|-----------|
+| RF-48 | El reporte de un día operativo se prepara a partir del cierre efectivo de ese día (el fin del horario base o de la última apertura extra, el que sea más tarde; 23:00 por defecto). Es un archivo `.xlsx` que se envía como documento de WhatsApp a cada número de `ADMIN_PHONES`. |
+| RF-49 | El reporte no se envía mientras haya pedidos del día pendientes (borradores, pedidos esperando confirmación o pedidos publicados sin tomar). El worker vuelve a verificar periódicamente y lo envía en cuanto todos están tomados, cancelados o vencidos. |
+| RF-50 | Si `REPORT_PENDING_REMINDER_MINUTES` (120) después del cierre efectivo (01:00 en un día normal) siguen quedando pedidos pendientes, se le recuerda una vez al administrador, con sus códigos, que los tome o cancele. El reporte espera sin límite. |
+| RF-51 | La hoja `Resumen` tiene una fila por motero con actividad en los pedidos del día: nombre, teléfono (si se conoce), cantidad de pedidos tomados, liberados y cancelados después de asignados. |
+| RF-52 | La hoja `Pedidos` tiene una fila por pedido publicado del día: código, horas de creación y asignación (en hora de Buenos Aires), nombre del local, dirección de retiro, dirección de entrega, producto, medio de pago, nombre del motero y estado. |
+| RF-53 | Si después de enviado el reporte un pedido del día se libera o se cancela, el sistema espera a que no queden pendientes de ese día y envía un reporte corregido, rotulado como corrección, con número de versión y la lista de cambios respecto de la última versión enviada ("Corrección: el pedido YV-0123 pasó de Joel a Emiliano"; "Corrección: el pedido YV-0123 fue cancelado (estaba asignado a Joel)"). |
+| RF-54 | Cada versión del reporte (original y correcciones) se envía una sola vez por destinatario, aunque el worker se reinicie o la tarea se ejecute más de una vez. Si el worker estuvo caído, los reportes pendientes se procesan en cuanto vuelve. |
 
 ### Auditoría e idempotencia
 
 | ID | Requisito |
 |----|-----------|
-| RF-45 | Todo cambio de estado de un pedido queda registrado en un log de auditoría (`order_events`). |
-| RF-46 | Todo cambio de horario (solicitado, confirmado, rechazado, vencido o levantado) queda registrado en `schedule_overrides`, con el texto original del administrador. |
-| RF-47 | Todos los mensajes entrantes y salientes quedan registrados como historial de conversación (`messages`). |
-| RF-48 | Los eventos duplicados del webhook (mismo id de mensaje de WhatsApp) se procesan una sola vez. |
-| RF-49 | Los mensajes salientes se envían a través de una bandeja de salida (`outbound_messages`) con clave de idempotencia, para no duplicar notificaciones ante reintentos. |
+| RF-55 | Todo cambio de estado de un pedido queda registrado en un log de auditoría (`order_events`). |
+| RF-56 | Todo cambio de horario (solicitado, confirmado, rechazado, vencido o levantado) queda registrado en `schedule_overrides`, con el texto original del administrador. |
+| RF-57 | Todos los mensajes entrantes y salientes quedan registrados como historial de conversación (`messages`). |
+| RF-58 | Los eventos duplicados del webhook (mismo id de mensaje de WhatsApp) se procesan una sola vez. |
+| RF-59 | Los mensajes salientes (textos, documentos, eliminaciones y ediciones) se envían a través de una bandeja de salida (`outbound_messages`) con clave de idempotencia, en orden por destinatario. |
 
 ## 4. Requisitos no funcionales
 
@@ -131,7 +142,7 @@ y procesamiento de audios o imágenes.
 | RNF-03 | **Idempotencia.** Reprocesar un mismo evento no produce efectos duplicados (ni cambios de estado ni mensajes). Se garantiza con restricciones únicas en Postgres. |
 | RNF-04 | **Consistencia.** Postgres es la fuente de verdad. Redis solo guarda la cola de trabajos, locks y contadores efímeros; perder Redis no debe perder pedidos, borradores ni cambios de horario. |
 | RNF-05 | **Concurrencia.** Los mensajes de un mismo local se procesan en serie (lock por local) para que la combinación de borradores sea consistente. |
-| RNF-06 | **Riesgo de bloqueo del número.** Evolution API usa Baileys (cliente no oficial de WhatsApp Web). Se usa un número dedicado, nunca el personal del cliente; no se envían mensajes masivos ni se inician conversaciones con desconocidos; los envíos salientes se limitan (`OUTBOUND_MIN_INTERVAL_MS`). Los cierres de horario no generan avisos masivos a locales. |
+| RNF-06 | **Riesgo de bloqueo del número.** Evolution API usa Baileys (cliente no oficial de WhatsApp Web). Se usa un número dedicado, nunca el personal del cliente; no se envían mensajes masivos ni se inician conversaciones con desconocidos; los envíos salientes se limitan (`OUTBOUND_MIN_INTERVAL_MS`). Los cambios de horario no generan avisos masivos a locales ni al grupo. |
 | RNF-07 | **Disponibilidad.** Si Evolution o el LLM no responden, los trabajos se reintentan con backoff; el pedido no se pierde. Si el LLM falla de forma persistente, se avisa al local que reintente y al administrador. |
 | RNF-08 | **Observabilidad.** Logs estructurados (JSON) con `order_id`, `store_id`, `courier_id` y `wa_message_id`; endpoint `/health`. |
 | RNF-09 | **Privacidad.** No se comparten datos de contacto entre las partes: el local solo ve el nombre visible del motero; el motero no recibe teléfonos del local. Los teléfonos de moteros solo aparecen en el reporte al administrador. |
@@ -140,36 +151,40 @@ y procesamiento de audios o imágenes.
 | RNF-12 | **Portabilidad.** Todos los servicios corren en contenedores Docker; desarrollo con Docker Compose y producción en Dokku sin cambios de código (solo configuración). |
 | RNF-13 | **Proveedor de LLM intercambiable.** La extracción de pedidos y la interpretación de cambios de horario se hacen detrás de interfaces propias; cambiar de proveedor o modelo es configuración. |
 | RNF-14 | **Idioma.** Código, identificadores y commits en inglés; mensajes al usuario y reporte en español, centralizados en el catálogo de mensajes. |
-| RNF-15 | **Zona horaria.** Las fechas se guardan en UTC (`timestamptz`); el horario, los cierres, la fecha del reporte y las horas que se muestran usan `TZ`. |
+| RNF-15 | **Zona horaria.** Las fechas se guardan en UTC (`timestamptz`); el horario, los cierres y aperturas, el día operativo (`business_date`) y las horas que se muestran usan `TZ`. |
 
 ## 5. Reglas de negocio
 
 | ID | Regla |
 |----|-------|
 | RN-01 | Un pedido tiene a lo sumo un motero asignado en cada momento. |
-| RN-02 | Gana la asignación el primer motero cuya reacción se procesa con éxito en la base (`UPDATE ... WHERE courier_id IS NULL`), no el primero en el orden de llegada del webhook. |
+| RN-02 | Gana la asignación el primer motero cuya reacción se procesa con éxito en la base (`UPDATE ... WHERE courier_id IS NULL AND status = 'published'`), no el primero en el orden de llegada del webhook. |
 | RN-03 | Cualquier emoji cuenta como toma. |
 | RN-04 | Solo el motero asignado puede liberar el pedido quitando su reacción. Quitar la reacción de un motero no asignado no tiene efecto. |
 | RN-05 | Un cambio de emoji del motero asignado no cambia nada. Un cambio de emoji de otro motero se trata como un intento de toma (normalmente rechazado porque ya está asignado). |
-| RN-06 | Un pedido solo puede liberarse mientras está `assigned`. Después de `cancelled`, quitar la reacción no tiene efecto. |
+| RN-06 | Un pedido solo puede liberarse mientras está `assigned`. Las reacciones (agregar o quitar) sobre un pedido `cancelled` no tienen efecto. |
 | RN-07 | Un pedido `assigned` se da por resuelto. Solo puede volver a `published` (liberación) o pasar a `cancelled`. |
-| RN-08 | Solo el local dueño del pedido (o el administrador) puede cancelarlo, esté publicado o asignado. |
-| RN-09 | Un local tiene como máximo un borrador abierto a la vez. |
+| RN-08 | Solo el local dueño del pedido (o el administrador) puede cancelarlo, esté esperando confirmación, publicado o asignado. La cancelación es igual la pida quien la pida; si la pide el administrador, también se avisa al local. |
+| RN-09 | Un local tiene como máximo un pedido en preparación a la vez (`draft` o `awaiting_confirmation`). |
 | RN-10 | Todo remitente privado que no es administrador ni motero conocido es un local; no hay registro previo. Los mensajes privados de un motero conocido nunca son pedidos. |
 | RN-11 | Todo participante del grupo de moteros que reacciona a una publicación es un motero, incluido el administrador; no hay registro previo. Su identidad es el id de participante (`lid` o `phone_jid`); el número es un dato complementario que puede faltar. |
 | RN-12 | Solo se consideran reacciones sobre publicaciones de pedidos hechas por el bot en el grupo configurado. |
 | RN-13 | No hay límite de pedidos asignados simultáneamente por motero. |
 | RN-14 | Los campos obligatorios del pedido son `pickup_address`, `delivery_address`, `product` y `payment_method` (sección 6). `notes` es opcional. |
-| RN-15 | Un pedido publicado no se puede modificar. Para corregirlo, el local lo cancela y lo envía de nuevo. Mientras tiene pedidos publicados o asignados, los mensajes nuevos del local abren un borrador nuevo. |
-| RN-16 | No se comparten datos de contacto: al local se le informa solo el nombre visible del motero y al motero solo el detalle del pedido (nombre del local, direcciones, producto, medio de pago, notas). |
-| RN-17 | Fuera del horario efectivo no se crean ni modifican borradores (regla estricta). Un borrador solo se publica si su último mensaje llegó dentro del horario efectivo; un dato faltante que llega fuera de horario recibe la respuesta de cierre y el borrador vence solo. |
-| RN-18 | Cada pedido se publica una sola vez en el grupo. Un pedido sin tomar genera como máximo una alerta al administrador por período de publicación; la decisión (esperar, avisar a moteros, cancelar) es del administrador. |
-| RN-19 | El reporte de la fecha D cubre los pedidos publicados cuya creación (`created_at`) cae en la fecha local D. Los conteos por motero son: tomados = pedidos del día asignados a él al generar el reporte; liberados = liberaciones de pedidos del día que lo tenían asignado; cancelados = pedidos del día cancelados mientras estaban asignados a él. |
-| RN-20 | El reporte de una fecha se envía una sola vez a cada administrador y solo cuando no quedan pedidos pendientes de esa fecha. |
-| RN-21 | Un cambio de horario solo se aplica después de la confirmación explícita del administrador. Cada administrador tiene como máximo una solicitud pendiente de confirmación; una instrucción nueva reemplaza a la anterior. |
-| RN-22 | Los cierres solo restringen el horario base; nunca lo amplían. |
-| RN-23 | `closed_today` cierra desde la confirmación hasta el fin del día local; `closed_until_further_notice` cierra desde la confirmación hasta un `reopen`; `closed_window` cierra entre las horas indicadas de la fecha indicada (hoy por defecto, nunca en el pasado). |
-| RN-24 | Los cierres no afectan a pedidos ya publicados o asignados: se pueden seguir tomando, liberando y cancelando. |
+| RN-15 | Ningún pedido se publica sin la confirmación explícita del local sobre el resumen vigente. Cualquier corrección invalida el resumen anterior y exige una nueva confirmación. |
+| RN-16 | Un pedido publicado no se puede modificar. Para corregirlo, el local lo cancela y lo envía de nuevo. Mientras tiene pedidos publicados o asignados, los mensajes nuevos del local abren un borrador nuevo. |
+| RN-17 | No se comparten datos de contacto: al local se le informa solo el nombre visible del motero y al motero solo el detalle del pedido (nombre del local, direcciones, producto, medio de pago, notas). |
+| RN-18 | Fuera del horario efectivo no se crean ni modifican borradores, no se envían resúmenes nuevos y no se publican pedidos, aunque el local confirme (regla estricta). El borrador o pedido sin confirmar vence solo. |
+| RN-19 | Cada pedido se publica una sola vez en el grupo. Un pedido sin tomar genera como máximo una alerta al administrador por período de publicación; la decisión (esperar, avisar a moteros, cancelar) es del administrador. |
+| RN-20 | Un pedido cancelado deja de estar en el grupo: se eliminan la publicación y las respuestas del bot sobre ese pedido (o se marcan como CANCELADO si no se pueden eliminar). |
+| RN-21 | Cada pedido pertenece al día operativo (`business_date`) en que se creó su borrador. El reporte del día D cubre los pedidos publicados de D. Los conteos por motero son: tomados = pedidos de D asignados a él al generar la versión del reporte; liberados = liberaciones de pedidos de D que lo tenían asignado; cancelados = pedidos de D cancelados mientras estaban asignados a él. |
+| RN-22 | Una versión del reporte se envía una sola vez a cada administrador y solo cuando no quedan pedidos pendientes de esa fecha. |
+| RN-23 | Una corrección se genera solo si, comparando con la última versión enviada, cambió el estado o el motero de algún pedido. Una liberación seguida de una nueva toma por el mismo motero no genera corrección. |
+| RN-24 | Un cambio de horario solo se aplica después de la confirmación explícita del administrador. Cada administrador tiene como máximo una solicitud pendiente de confirmación; una instrucción nueva reemplaza a la anterior. |
+| RN-25 | Las aperturas extra (`open_window`) amplían el horario base dentro de los límites configurados; los cierres lo restringen. Ante una superposición, gana el cierre. |
+| RN-26 | `closed_today` cierra desde la confirmación hasta el fin del día operativo (incluidas las aperturas extra de ese día); `closed_until_further_notice` cierra desde la confirmación hasta un `reopen`; `closed_window` y `open_window` rigen entre las horas indicadas de la fecha indicada (hoy por defecto, nunca en el pasado). |
+| RN-27 | Una apertura extra solo puede cargarse para un día cuyo reporte original todavía no se generó. |
+| RN-28 | Los cambios de horario no afectan a pedidos ya publicados o asignados: se pueden seguir tomando, liberando y cancelando. |
 
 ## 6. Datos del pedido
 
@@ -220,24 +235,31 @@ Ejemplo canónico de mensaje de un local:
 | DC-10 | Confirmación de retiro | No. |
 | DC-11 | Retención de datos | 90 días; luego se anonimizan. |
 | DC-12 | Pedidos asignados sin entregar | Reemplazada por DC-16 (no hay seguimiento de entrega). |
-| DC-13 | Horario | De 09:00 a 23:00 (Buenos Aires). Fuera de horario se responde al local y no se crean pedidos. |
+| DC-13 | Horario | Base de 09:00 a 23:00 (Buenos Aires). Fuera de horario se responde al local y no se crean pedidos. |
 | DC-14 | Administrador | El cliente (jefe de los moteros); su número va en `ADMIN_PHONES`. |
-| DC-15 | Reporte diario | Excel diario enviado por WhatsApp al administrador, con resumen por motero y detalle de pedidos (condiciones de envío en DC-17). |
-| DC-16 | Seguimiento de entrega | No existe. Un pedido se da por resuelto y se cuenta cuando un motero lo toma. Se eliminan el estado `delivered`, el comando `entregado`, el recordatorio de entrega y el comando `cerrar`. |
-| DC-17 | Envío del reporte | Se prepara a las 23:00 pero no se envía mientras haya pedidos del día sin tomar. Se envía cuando todos están tomados o cancelados. Si a la 01:00 siguen pendientes, se le recuerda al administrador con los códigos. |
+| DC-15 | Reporte diario | Excel enviado por WhatsApp al administrador, con resumen por motero y detalle de pedidos (condiciones en DC-17, DC-24 y DC-27). |
+| DC-16 | Seguimiento de entrega | No existe. Un pedido se da por resuelto y se cuenta cuando un motero lo toma. |
+| DC-17 | Envío del reporte | No se envía mientras haya pedidos del día pendientes; se envía cuando todos están tomados o cancelados. Recordatorio único al administrador con los códigos (01:00 en un día normal); el reporte espera sin límite. |
 | DC-18 | Administrador que reacciona en el grupo | Toma el pedido como cualquier motero. |
 | DC-19 | Motero que escribe por privado | Sus mensajes privados son solo de motero; nunca son pedidos. |
-| DC-20 | Dato faltante después de las 23:00 | Regla estricta: respuesta de fuera de horario y el borrador vence. |
-| DC-21 | Alcance del reporte | Los pedidos creados en el día; los conteos se hacen al momento de la toma (ya no aplica la jornada de 23 a 23). |
-| DC-22 | Comandos del administrador | `cancelar` y `liberar` (más `estado`/`horario` y los cambios de horario). |
-| DC-23 | Cambios de horario del día | El administrador cierra o reabre en lenguaje natural; el bot interpreta, resume, pide confirmación y recién entonces aplica. La respuesta a los locales incluye el motivo. |
+| DC-20 | Datos o confirmación fuera de horario | Regla estricta: respuesta de cierre y el pedido vence. |
+| DC-21 | Alcance del reporte | Los pedidos del día operativo; los conteos se hacen al momento de la toma. |
+| DC-22 | Comandos del administrador | `cancelar` y `liberar`, más `estado`/`horario` y los cambios de horario en lenguaje natural. |
+| DC-23 | Cambios de horario del día | El administrador los escribe en lenguaje natural; el bot interpreta, resume, pide confirmación y recién entonces aplica. La respuesta a los locales incluye el motivo. |
+| DC-24 | Extender el horario (ex PA-01) | Sí: aperturas extra (`open_window`, por ejemplo "hoy hasta las 00") con límites razonables y el mismo flujo de confirmación. El reporte se prepara al cierre efectivo del día, no a las 23:00 fijas. |
+| DC-25 | Aviso al grupo de cierres (ex PA-02) | No se avisa. |
+| DC-26 | Recordatorio de cierre "hasta nuevo aviso" (ex PA-03) | Sí, una vez al comenzar el horario base de cada día. |
+| DC-27 | Cambios después del reporte (ex PA-04) | Si un pedido se libera o se cancela después del envío, se espera a que se resuelva y se envía un reporte corregido, rotulado como corrección, con los cambios. Las versiones se registran. |
+| DC-28 | Recordatorio de reporte retenido (ex PA-05) | Uno solo; el reporte espera sin límite. |
+| DC-29 | Confirmación del local | Antes de publicar, el bot muestra el resumen del pedido y el local debe responder SÍ; puede corregir o cancelar en ese paso. |
+| DC-30 | Cancelación de pedidos publicados | Se elimina la publicación del grupo. Si ya lo había tomado un motero, se le avisa por privado con el detalle. Igual para el local y el administrador; si cancela el administrador, se avisa al local. |
 
 ## 9. Preguntas abiertas
 
 | ID | Pregunta | Propuesta por defecto |
 |----|----------|------------------------|
-| PA-01 | ¿Se quiere poder ampliar el horario del día (por ejemplo, "hoy tomamos hasta las 00")? | No en v1; los cierres solo restringen (RN-22). |
-| PA-02 | Cuando el administrador cierra la toma de pedidos, ¿se avisa en el grupo de moteros? | No. |
-| PA-03 | Si hay un cierre "hasta nuevo aviso", ¿se le recuerda al administrador cada mañana al abrir? | Sí, una vez al comenzar el horario base (RF-37). |
-| PA-04 | ¿Se puede cancelar un pedido asignado de un día cuyo reporte ya se envió? (El reporte enviado no se corrige.) | Sí; queda registrado en la auditoría, pero no se reenvía el reporte. |
-| PA-05 | Si a la 01:00 siguen pedidos pendientes y el recordatorio no alcanza, ¿se repite (por ejemplo, cada hora) o se envía el reporte igual en algún momento? | Un único recordatorio; el reporte espera sin límite. |
+| PA-01 | Si un pedido se libera y lo vuelve a tomar el mismo motero después del reporte, el conteo de "liberados" cambia pero no el resultado. ¿Se envía corrección igual? | No (RN-23); el conteo actualizado aparece en la próxima corrección, si la hay. |
+| PA-02 | Al cancelar, ¿se borran también los mensajes "Asignado a…" del bot en el grupo, o solo la publicación? | Se borran todos los mensajes del bot sobre ese pedido. |
+| PA-03 | ¿Hasta qué hora como máximo se puede extender? | Hasta las 02:00 del día siguiente, y no antes de las 06:00 (`SCHEDULE_LATEST_CLOSE_TIME`, `SCHEDULE_EARLIEST_OPEN_TIME`). |
+| PA-04 | ¿Se puede extender el horario de un día cuyo reporte ya se generó (por ejemplo, a las 23:30 "hoy hasta la 01")? | No; se responde que el reporte del día ya se generó (RN-27). |
+| PA-05 | ¿Cuánto tiempo tiene el local para confirmar el resumen? | El mismo vencimiento del borrador, 30 minutos sin actividad (`DRAFT_TTL_MINUTES`). |

@@ -6,18 +6,23 @@ nada que no pueda reconstruirse (cola, locks y contadores de límite de frecuenc
 
 Decisiones:
 
-- **El borrador es un pedido en estado `draft`**, no una tabla aparte. Un índice único parcial garantiza
-  un solo borrador por local (RN-09).
+- **El borrador es un pedido en estado `draft`** (o `awaiting_confirmation` mientras espera el "sí" del
+  local), no una tabla aparte. Un índice único parcial garantiza un solo pedido en preparación por local (RN-09).
+- **Cada pedido tiene un día operativo (`business_date`)**, fijado al crear el borrador. Es la clave del
+  reporte diario y no depende de la fecha calendario (las extensiones pueden pasar la medianoche).
 - **Una sola publicación por pedido** (no hay republicación): el id del mensaje del grupo se guarda en
   `orders.group_message_id`, con restricción única. No hace falta una tabla `group_posts`.
 - **Locales y moteros se dan de alta solos.** Su identidad es el identificador de WhatsApp que llega en
   el evento (JID de número o `@lid`); el número de teléfono es un dato complementario que puede faltar.
 - **Idempotencia por restricciones únicas**: `inbound_events.wa_message_id`,
-  `outbound_messages.idempotency_key`, `orders.group_message_id`, `daily_reports.report_date`.
+  `outbound_messages.idempotency_key`, `orders.group_message_id`, `daily_reports.report_date`,
+  `report_revisions (daily_report_id, revision)`.
+- **El reporte tiene versiones**: `daily_reports` es la cabecera por fecha y `report_revisions` guarda cada
+  versión enviada (original y correcciones) con su archivo, la foto de los pedidos y los cambios.
 - **No hay seguimiento de entrega**: el pedido termina su ciclo útil en `assigned`; no existen columnas de
   retiro ni de entrega.
 - **Los cambios de horario son filas, no configuración**: el horario base viene de variables de entorno y
-  los cierres del administrador se guardan en `schedule_overrides` con su historial completo.
+  los cierres y aperturas del administrador se guardan en `schedule_overrides` con su historial completo.
 - **Estados como `text` con `CHECK`** (en lugar de `ENUM` de Postgres), más simple de migrar con Alembic.
 - Claves primarias `bigint generated always as identity`. Fechas `timestamptz` en UTC.
 - Teléfonos en E.164 sin `+` (`5491155551234`).
@@ -34,7 +39,8 @@ erDiagram
     inbound_events ||--o| messages : "normalized into"
     stores |o--o{ messages : "chat"
     couriers |o--o{ messages : "chat"
-    daily_reports |o--o{ outbound_messages : "sent as"
+    daily_reports ||--o{ report_revisions : "has versions"
+    report_revisions |o--o{ outbound_messages : "sent as"
     schedule_overrides |o--o{ schedule_overrides : "cancels"
     inbound_events |o--o{ schedule_overrides : "requested by"
 
@@ -68,6 +74,7 @@ erDiagram
         text code UK "YV-0042, set on publish"
         bigint store_id FK
         text status
+        date business_date
         bigint courier_id FK "nullable"
         bigint last_courier_id FK "nullable"
         text pickup_address
@@ -81,7 +88,10 @@ erDiagram
         int missing_prompts_count
         timestamptz draft_expires_at
         timestamptz last_store_message_at
+        timestamptz confirmation_requested_at
+        timestamptz confirmed_at
         text group_message_id UK
+        timestamptz group_post_deleted_at
         timestamptz published_at
         timestamptz unclaimed_alert_at
         timestamptz unclaimed_alert_sent_at
@@ -143,12 +153,13 @@ erDiagram
         bigint id PK
         text idempotency_key UK
         text template_key
-        text message_type "text or document"
+        text message_type "text, document, delete, edit"
         text recipient_jid
         text quoted_wa_message_id
+        text target_wa_message_id
         text body
         bigint order_id FK
-        bigint daily_report_id FK
+        bigint report_revision_id FK
         text status
         int attempts
         text last_error
@@ -161,13 +172,26 @@ erDiagram
         bigint id PK
         date report_date UK
         text status
+        timestamptz due_at
+        int current_revision
         int pending_orders_count
         timestamptz last_checked_at
         timestamptz pending_reminder_sent_at
+        timestamptz correction_requested_at
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    report_revisions {
+        bigint id PK
+        bigint daily_report_id FK
+        int revision
+        text kind "initial or correction"
+        text status
+        jsonb snapshot
+        jsonb changes
         text file_name
         bytea file_content
-        int orders_count
-        int couriers_count
         int attempts
         text last_error
         timestamptz generated_at
@@ -179,7 +203,7 @@ erDiagram
         bigint id PK
         text kind
         text status
-        date local_date "nullable"
+        date business_date "nullable"
         timestamptz starts_at
         timestamptz ends_at "nullable = open-ended"
         text reason
@@ -250,7 +274,8 @@ Para enviar privados al motero se usa `phone_jid` si existe; si no, `lid` (ver r
 | `id` | `bigint` | PK, identity | |
 | `code` | `text` | `UNIQUE`, nullable | Al publicar: `ORDER_CODE_PREFIX` + secuencia `order_code_seq` (`YV-0042`). |
 | `store_id` | `bigint` | `NOT NULL`, FK → `stores.id` | |
-| `status` | `text` | `NOT NULL`, `CHECK (status IN ('draft','published','assigned','cancelled','expired'))` | |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('draft','awaiting_confirmation','published','assigned','cancelled','expired'))` | |
+| `business_date` | `date` | `NOT NULL` | Día operativo en que se creó el borrador (ver [03](03-estados-pedido.md)). |
 | `courier_id` | `bigint` | FK → `couriers.id`, nullable | Motero asignado actual. |
 | `last_courier_id` | `bigint` | FK → `couriers.id`, nullable | Último motero que lo tuvo (cancelaciones, reporte). |
 | `pickup_address` | `text` | nullable | Obligatorio para publicar. Texto libre. |
@@ -262,9 +287,12 @@ Para enviar privados al motero se usa `phone_jid` si existe; si no, `lid` (ver r
 | `extraction` | `jsonb` | `NOT NULL DEFAULT '{}'` | Resultado combinado de las extracciones, para depuración. |
 | `validation_errors` | `jsonb` | `NOT NULL DEFAULT '[]'` | Última validación: `[{"field": "payment_method", "code": "missing"}]`. |
 | `missing_prompts_count` | `int` | `NOT NULL DEFAULT 0` | |
-| `draft_expires_at` | `timestamptz` | nullable | Solo en `draft`. |
+| `draft_expires_at` | `timestamptz` | nullable | En `draft` y `awaiting_confirmation`; se renueva con cada mensaje y al enviar el resumen. |
 | `last_store_message_at` | `timestamptz` | nullable | Para el intervalo de agrupación. |
-| `group_message_id` | `text` | `UNIQUE`, nullable | `key.id` de la publicación en el grupo. |
+| `confirmation_requested_at` | `timestamptz` | nullable | Último resumen enviado al local. Un "sí" anterior a una corrección posterior no confirma (RN-15). |
+| `confirmed_at` | `timestamptz` | nullable | "Sí" del local. |
+| `group_message_id` | `text` | `UNIQUE`, nullable | `key.id` de la publicación en el grupo. Se conserva tras eliminarla (para reconocer reacciones tardías). |
+| `group_post_deleted_at` | `timestamptz` | nullable | Eliminación confirmada de la publicación (o marcado como CANCELADO). |
 | `published_at` | `timestamptz` | nullable | |
 | `unclaimed_alert_at` | `timestamptz` | nullable | Momento en que corresponde alertar si sigue sin tomar. |
 | `unclaimed_alert_sent_at` | `timestamptz` | nullable | No nulo = ya se alertó en este período de publicación. |
@@ -276,9 +304,9 @@ Para enviar privados al motero se usa `phone_jid` si existe; si no, `lid` (ver r
 Restricciones adicionales:
 
 ```sql
--- At most one open draft per store (RN-09)
+-- At most one order in preparation per store (RN-09)
 CREATE UNIQUE INDEX orders_one_draft_per_store
-    ON orders (store_id) WHERE status = 'draft';
+    ON orders (store_id) WHERE status IN ('draft', 'awaiting_confirmation');
 
 -- courier_id is set only while assigned
 ALTER TABLE orders ADD CONSTRAINT orders_courier_matches_status CHECK (
@@ -295,13 +323,13 @@ ALTER TABLE orders ADD CONSTRAINT orders_code_when_published CHECK (
 
 | Índice | Uso |
 |--------|-----|
-| `orders_one_draft_per_store` (único parcial) | Buscar el borrador del local; garantizar uno solo. |
+| `orders_one_draft_per_store` (único parcial) | Buscar el pedido en preparación del local; garantizar uno solo. |
 | `(unclaimed_alert_at) WHERE status = 'published' AND unclaimed_alert_sent_at IS NULL` | Alerta de pedidos sin tomar. |
-| `(draft_expires_at) WHERE status = 'draft'` | Vencimiento de borradores. |
+| `(draft_expires_at) WHERE status IN ('draft','awaiting_confirmation')` | Vencimiento de borradores y confirmaciones. |
 | `(courier_id) WHERE status = 'assigned'` | Resumen por motero. |
 | `(store_id, created_at DESC)` | Pedidos activos del local. |
-| `(created_at) WHERE status IN ('draft','published')` | Pedidos pendientes que retienen el reporte diario. |
-| `(created_at)` | Detalle del reporte diario (pedidos creados en la fecha). |
+| `(business_date) WHERE status IN ('draft','awaiting_confirmation','published')` | Pedidos pendientes que retienen el reporte o su corrección. |
+| `(business_date)` | Contenido del reporte diario. |
 
 ### `order_events` (auditoría)
 
@@ -309,7 +337,7 @@ ALTER TABLE orders ADD CONSTRAINT orders_code_when_published CHECK (
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
 | `order_id` | `bigint` | `NOT NULL`, FK → `orders.id` | |
-| `event_type` | `text` | `NOT NULL` | `created`, `draft_updated`, `missing_fields_requested`, `published`, `claimed`, `claim_rejected`, `released_by_courier`, `released_by_admin`, `unclaimed_alert_sent`, `cancelled`, `expired`. |
+| `event_type` | `text` | `NOT NULL` | `created`, `draft_updated`, `missing_fields_requested`, `confirmation_requested`, `confirmed`, `published`, `claimed`, `claim_rejected`, `reaction_on_cancelled`, `released_by_courier`, `released_by_admin`, `unclaimed_alert_sent`, `cancelled`, `group_post_deleted`, `group_post_delete_failed`, `expired`. |
 | `actor_type` | `text` | `NOT NULL`, `CHECK (actor_type IN ('store','courier','system','admin'))` | |
 | `actor_id` | `bigint` | nullable | Id de `stores` o `couriers` según `actor_type`. |
 | `courier_id` | `bigint` | FK → `couriers.id`, nullable | Motero afectado por el evento (base del resumen por motero del reporte). |
@@ -320,7 +348,7 @@ ALTER TABLE orders ADD CONSTRAINT orders_code_when_published CHECK (
 
 Índices: `(order_id, created_at)`, `(created_at, courier_id)` (reporte diario).
 
-Mapeo al resumen del reporte (por `courier_id`, sobre los pedidos creados en la fecha D, RN-19):
+Mapeo al resumen del reporte (por `courier_id`, sobre los pedidos con `business_date = D`, RN-21):
 
 | Columna del reporte | Cálculo |
 |---------------------|---------|
@@ -378,14 +406,15 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 | Columna | Tipo | Restricciones | Notas |
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
-| `idempotency_key` | `text` | `NOT NULL`, `UNIQUE` | Ej.: `order:42:claimed:courier:7`, `daily_report:2026-10-09:5491100000000`. |
+| `idempotency_key` | `text` | `NOT NULL`, `UNIQUE` | Ej.: `order:42:claimed:courier:7`, `order:42:delete:<wa_message_id>`, `daily_report:2026-10-09:v2:5491100000000`. |
 | `template_key` | `text` | `NOT NULL` | Clave del [catálogo](07-catalogo-mensajes.md). |
-| `message_type` | `text` | `NOT NULL DEFAULT 'text'`, `CHECK (message_type IN ('text','document'))` | |
+| `message_type` | `text` | `NOT NULL DEFAULT 'text'`, `CHECK (message_type IN ('text','document','delete','edit'))` | `delete`: eliminar para todos un mensaje propio; `edit`: editar un mensaje propio (respaldo de la eliminación). |
 | `recipient_jid` | `text` | `NOT NULL` | |
 | `quoted_wa_message_id` | `text` | nullable | Para responder citando (grupo). |
-| `body` | `text` | `NOT NULL` | Texto renderizado, o el pie (caption) si es documento. |
+| `target_wa_message_id` | `text` | nullable | Mensaje a eliminar o editar (`delete`, `edit`). |
+| `body` | `text` | `NOT NULL DEFAULT ''` | Texto renderizado, el pie (caption) si es documento o el texto nuevo si es `edit`. |
 | `order_id` | `bigint` | FK → `orders.id`, nullable | |
-| `daily_report_id` | `bigint` | FK → `daily_reports.id`, nullable | Si `message_type = 'document'`, el archivo sale de `daily_reports.file_content`. |
+| `report_revision_id` | `bigint` | FK → `report_revisions.id`, nullable | Si `message_type = 'document'`, el archivo sale de `report_revisions.file_content`. |
 | `status` | `text` | `NOT NULL DEFAULT 'pending'`, `CHECK (status IN ('pending','sending','sent','failed'))` | |
 | `attempts` | `int` | `NOT NULL DEFAULT 0` | |
 | `last_error` | `text` | nullable | |
@@ -393,46 +422,81 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 | `sent_at` | `timestamptz` | nullable | |
 
-Índices: `(status, created_at) WHERE status IN ('pending','failed')`, `(wa_message_id)`.
+Índices: `(status, created_at) WHERE status IN ('pending','failed')`, `(wa_message_id)`,
+`(recipient_jid, id) WHERE status IN ('pending','sending')` (orden FIFO por destinatario).
+
+Las respuestas del bot en el grupo sobre un pedido (publicación, "Asignado a…", "vuelve a estar
+disponible") se encuentran con `order_id` + `recipient_jid = COURIERS_GROUP_JID` + `message_type = 'text'`;
+al cancelar se encola un `delete` por cada una.
 
 ### `daily_reports`
 
-Un registro por fecha; garantiza que el reporte se genere y envíe una sola vez, y solo cuando no quedan
-pedidos pendientes de esa fecha (RN-20).
+Cabecera del reporte de cada día operativo. Coordina la espera de pendientes, el recordatorio y las
+correcciones (RN-22, RN-23).
 
 | Columna | Tipo | Restricciones | Notas |
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
-| `report_date` | `date` | `NOT NULL`, `UNIQUE` | Fecha local (`TZ`) cuyos pedidos cubre el reporte (por `created_at`). |
-| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','generated','sent','failed'))` | `waiting`: hay pedidos pendientes de la fecha. |
+| `report_date` | `date` | `NOT NULL`, `UNIQUE` | Día operativo (`business_date`) que cubre el reporte. |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','sent','correction_pending','failed'))` | `waiting`: hay pendientes antes del primer envío. `correction_pending`: hubo cambios después de un envío. |
+| `due_at` | `timestamptz` | `NOT NULL` | Cierre efectivo del día (`report_due_at(D)`); se recalcula mientras está `waiting`. |
+| `current_revision` | `int` | `NOT NULL DEFAULT 0` | Última versión enviada (0 = ninguna). |
 | `pending_orders_count` | `int` | `NOT NULL DEFAULT 0` | Última cuenta de pendientes. |
 | `last_checked_at` | `timestamptz` | nullable | Última verificación de pendientes. |
-| `pending_reminder_sent_at` | `timestamptz` | nullable | Recordatorio de `REPORT_PENDING_REMINDER_TIME` enviado (una vez). |
-| `file_name` | `text` | nullable | `reporte-ya-voy-2026-10-09.xlsx`. |
+| `pending_reminder_sent_at` | `timestamptz` | nullable | Recordatorio de `REPORT_PENDING_REMINDER_MINUTES` enviado (una vez, solo antes del primer envío). |
+| `correction_requested_at` | `timestamptz` | nullable | Primer cambio posterior al último envío. |
+| `created_at`, `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+
+### `report_revisions`
+
+Cada versión del reporte. La revisión 1 es el original; las siguientes son correcciones.
+
+| Columna | Tipo | Restricciones | Notas |
+|---------|------|---------------|-------|
+| `id` | `bigint` | PK, identity | |
+| `daily_report_id` | `bigint` | `NOT NULL`, FK → `daily_reports.id` | |
+| `revision` | `int` | `NOT NULL`, `UNIQUE (daily_report_id, revision)` | |
+| `kind` | `text` | `NOT NULL`, `CHECK (kind IN ('initial','correction'))` | |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('generating','generated','sent','failed'))` | |
+| `snapshot` | `jsonb` | `NOT NULL` | Foto de los pedidos del día: `{order_id: {code, status, courier_id, courier_name}}`. Base para calcular la próxima corrección. |
+| `changes` | `jsonb` | `NOT NULL DEFAULT '[]'` | Cambios respecto de la revisión anterior: `[{"code": "YV-0123", "type": "courier_changed", "from": "Joel", "to": "Emiliano"}]`. Tipos: `courier_changed`, `cancelled`. |
+| `file_name` | `text` | nullable | `reporte-ya-voy-2026-10-09.xlsx`, `reporte-ya-voy-2026-10-09-correccion-2.xlsx`. |
 | `file_content` | `bytea` | nullable | El archivo (decenas de KB). Se borra por retención. |
-| `orders_count`, `couriers_count` | `int` | nullable | |
 | `attempts` | `int` | `NOT NULL DEFAULT 0` | |
 | `last_error` | `text` | nullable | |
 | `generated_at`, `sent_at` | `timestamptz` | nullable | |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+
+Cálculo de cambios (`diff_snapshots(previous, current)`), por pedido presente en la revisión anterior:
+
+| Antes | Ahora | Cambio |
+|-------|-------|--------|
+| `assigned` a A | `assigned` a B (B ≠ A) | `courier_changed` A → B ("pasó de Joel a Emiliano") |
+| `assigned` a A | `cancelled` | `cancelled` ("fue cancelado (estaba asignado a Joel)") |
+| `assigned` a A | `assigned` a A | Sin cambio (aunque haya habido liberación y nueva toma; RN-23) |
+| `cancelled` | `cancelled` | Sin cambio |
 
 Contenido del archivo:
 
 | Hoja | Columnas |
 |------|----------|
 | `Resumen` | Motero, Teléfono (vacío si solo se conoce el `@lid`), Tomados, Liberados, Cancelados |
-| `Pedidos` | Código, Creado, Asignado (hora de Buenos Aires), Local, Retiro, Entrega, Producto, Medio de pago, Motero, Estado (`assigned` → "Tomado", `cancelled` → "Cancelado") |
+| `Pedidos` | Código, Creado, Asignado (hora de Buenos Aires), Local, Retiro, Entrega, Producto, Medio de pago, Motero, Estado (`assigned` → "Tomado", `cancelled` → "Cancelado"); en correcciones, además "Cambio" |
+| `Correcciones` | Solo en correcciones: Código, Antes, Ahora, Detalle |
+
+El nombre del archivo y el pie del mensaje indican la versión; la primera fila de cada hoja de una corrección
+dice "CORRECCIÓN — versión N".
 
 Pedidos pendientes que retienen el envío:
 
 ```sql
 SELECT id, code, status
   FROM orders
- WHERE (created_at AT TIME ZONE :tz)::date = :report_date
-   AND status IN ('draft', 'published');
+ WHERE business_date = :report_date
+   AND status IN ('draft', 'awaiting_confirmation', 'published');
 ```
 
-Los borradores no tienen código; no se listan en el recordatorio y vencen solos en `DRAFT_TTL_MINUTES`.
+Los borradores y pedidos sin confirmar no tienen código; no se listan en el recordatorio y vencen solos en `DRAFT_TTL_MINUTES`.
 
 ### `schedule_overrides` (cambios de horario)
 
@@ -442,11 +506,11 @@ Cada instrucción de horario del administrador, con su interpretación y su cicl
 | Columna | Tipo | Restricciones | Notas |
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
-| `kind` | `text` | `NOT NULL`, `CHECK (kind IN ('closed_today','closed_until_further_notice','closed_window','reopen'))` | |
-| `status` | `text` | `NOT NULL`, `CHECK (status IN ('pending_confirmation','active','applied','cancelled','rejected','expired','superseded'))` | `applied` solo para `reopen`; `active`/`cancelled` solo para cierres. |
-| `local_date` | `date` | nullable | Fecha local afectada (`closed_today`, `closed_window`). Nula en `closed_until_further_notice` y `reopen`. |
-| `starts_at` | `timestamptz` | nullable | Inicio concreto del cierre. `closed_today` y `closed_until_further_notice`: momento de confirmación. `closed_window`: fecha + hora de inicio. |
-| `ends_at` | `timestamptz` | nullable | Fin concreto. `closed_today`: 24:00 local. `closed_window`: fecha + hora de fin. Nulo = hasta nuevo aviso. |
+| `kind` | `text` | `NOT NULL`, `CHECK (kind IN ('closed_today','closed_until_further_notice','closed_window','open_window','reopen'))` | `open_window` amplía el horario; los demás `closed_*` lo restringen. |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('pending_confirmation','active','applied','cancelled','rejected','expired','superseded'))` | `applied` solo para `reopen`; `cancelled` solo para cierres. |
+| `business_date` | `date` | nullable | Día operativo afectado (`closed_today`, `closed_window`, `open_window`). Nulo en `closed_until_further_notice` y `reopen`. |
+| `starts_at` | `timestamptz` | nullable | Inicio concreto. `closed_today` y `closed_until_further_notice`: momento de confirmación. `closed_window` y `open_window`: día + hora de inicio. |
+| `ends_at` | `timestamptz` | nullable | Fin concreto. `closed_today`: fin del día operativo (`BUSINESS_DAY_ROLLOVER_TIME` del día siguiente). `closed_window` y `open_window`: día + hora de fin (puede ser después de medianoche, hasta `SCHEDULE_LATEST_CLOSE_TIME`). Nulo = hasta nuevo aviso. |
 | `reason` | `text` | nullable | Motivo como frase corta usable tras "por" ("lluvia"). |
 | `source_text` | `text` | `NOT NULL` | Mensaje original del administrador. |
 | `parsed` | `jsonb` | `NOT NULL` | Salida del LLM (`ScheduleOverrideIntent`), para auditoría. |
@@ -462,18 +526,18 @@ Cada instrucción de horario del administrador, con su interpretación y su cicl
 Restricciones e índices:
 
 ```sql
--- At most one pending confirmation per admin (RN-21)
+-- At most one pending confirmation per admin (RN-24)
 CREATE UNIQUE INDEX schedule_overrides_one_pending_per_admin
     ON schedule_overrides (created_by) WHERE status = 'pending_confirmation';
 
--- Closures must have a start; windows must have a valid end
+-- Applied overrides must have a start; windows must have a valid end
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_period CHECK (
     kind = 'reopen'
     OR status IN ('pending_confirmation', 'rejected', 'expired', 'superseded')
     OR starts_at IS NOT NULL
 );
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_window CHECK (
-    kind <> 'closed_window' OR (ends_at IS NOT NULL AND starts_at < ends_at)
+    kind NOT IN ('closed_window', 'open_window') OR (ends_at IS NOT NULL AND starts_at < ends_at)
 );
 
 -- Effective-hours lookup
@@ -545,14 +609,15 @@ class ScheduleOverrideKind(StrEnum):
     CLOSED_TODAY = "closed_today"
     CLOSED_UNTIL_FURTHER_NOTICE = "closed_until_further_notice"
     CLOSED_WINDOW = "closed_window"
+    OPEN_WINDOW = "open_window"
     REOPEN = "reopen"
 
 
 class ScheduleOverrideIntent(BaseModel):
     kind: ScheduleOverrideKind | None = None  # None = not a schedule instruction
-    date: date | None = None  # closed_window only; defaults to today
-    start_time: time | None = None  # closed_window only
-    end_time: time | None = None  # closed_window only
+    date: date | None = None  # closed_window / open_window; defaults to today's business date
+    start_time: time | None = None  # closed_window / open_window
+    end_time: time | None = None  # closed_window / open_window; may be past midnight (e.g. 00:00, 01:00)
     reason: str | None = None  # short noun phrase usable after "por", e.g. "lluvia"
 ```
 
@@ -561,14 +626,21 @@ class ScheduleOverrideIntent(BaseModel):
 | "hoy no tomamos pedidos por lluvia" | `{"kind": "closed_today", "reason": "lluvia"}` |
 | "hoy no tomamos pedidos hasta nuevo aviso" | `{"kind": "closed_until_further_notice", "reason": null}` |
 | "de 15 a 18 no tomaremos pedidos hoy" | `{"kind": "closed_window", "date": "<hoy>", "start_time": "15:00", "end_time": "18:00"}` |
+| "hoy hasta las 00" | `{"kind": "open_window", "date": "<hoy>", "start_time": "23:00", "end_time": "00:00"}` (fin del horario base a medianoche) |
+| "mañana abrimos a las 8" | `{"kind": "open_window", "date": "<mañana>", "start_time": "08:00", "end_time": "09:00"}` |
 | "ya tomamos pedidos de nuevo" | `{"kind": "reopen"}` |
 | "¿cuántos pedidos hubo hoy?" | `{"kind": null}` |
 
 Validación determinística (`validate_schedule_intent`), antes de pedir confirmación:
 
-- `closed_window` requiere `start_time` y `end_time`, con `start_time < end_time`; `date` nula se toma como hoy.
+- `closed_window` y `open_window` requieren `start_time` y `end_time`; `date` nula se toma como el día operativo actual.
+  Las horas anteriores a `BUSINESS_DAY_ROLLOVER_TIME` se interpretan como del día calendario siguiente
+  (`00:00` → 24:00, `01:00` → 25:00), y debe quedar inicio < fin.
 - `date` no puede ser pasada y, si es hoy, `end_time` debe ser posterior a la hora actual.
-- La ventana se recorta al horario base; si queda vacía (totalmente fuera de 09:00–23:00), es inválida.
+- `closed_window` se recorta al horario efectivo del día; si queda vacía, es inválida.
+- `open_window` debe quedar entre `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del
+  día siguiente), debe agregar tiempo fuera del horario base (la parte que se superpone se ignora) y su día no puede
+  tener el reporte original ya generado (`daily_reports.current_revision = 0` y estado `waiting` o inexistente).
 - Horas ambiguas ("de 3 a 6") se interpretan dentro del horario base (15:00–18:00); el resumen de
   confirmación muestra siempre las horas en formato 24 h para que el administrador lo verifique.
 - `reopen` solo se propone si hay cierres en vigor; si no, se responde sin pedir confirmación.
