@@ -253,6 +253,22 @@ el cliente los apruebe o los cambie:
 | Elementos de `{schedule_note}` (separados por ", ", ordenados por hora de inicio) | Los mismos de la etapa 7a: "cierre de hoy{reason_text}", "cierre de {window_start} a {window_end}{reason_text}", "apertura del {date} de {window_start} a {window_end}{reason_text}" |
 | Fechas y horas del archivo | Hora de Buenos Aires, formato `dd/mm/aaaa hh:mm` |
 
+### Propuestas de la etapa 5a/6a (pendientes de aprobación)
+
+Textos de la toma y la cancelación que el código necesita y que este catálogo todavía no define. Se usan así
+hasta que el cliente los apruebe o los cambie:
+
+| Uso | Texto propuesto |
+|-----|-----------------|
+| `store_cancel_nothing_active`: el local escribe `cancelar` sin código ni cita y no tiene pedidos en preparación ni activos | No tenés pedidos activos para cancelar. |
+| `{active_codes}` sin pedidos activos (`store_order_not_found`) | ninguno |
+| Separador de `{active_codes}` | ", " (p. ej. "YV-0001, YV-0002") |
+| `{code}` de `store_cancel_ambiguous` ("por ejemplo *cancelar {code}*") | El primer código de `{active_codes}` |
+| `{reason}` de `admin_command_error` | código inexistente: "no existe un pedido con ese código"; cancelado o vencido: "ya está {status_label}"; `liberar` de un pedido sin motero: "no está asignado a ningún motero" |
+
+`sí` o `no` sin un pedido esperando confirmación (ninguno, o un borrador que todavía se está evaluando) no
+tienen respuesta.
+
 ## Reglas de envío
 
 - Los mensajes al grupo derivados de una publicación (`group_order_assigned`, `group_order_unassigned`,

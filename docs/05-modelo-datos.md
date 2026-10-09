@@ -424,7 +424,7 @@ ALTER TABLE messages ADD CONSTRAINT messages_outbound_message_only_out
 | Columna | Tipo | Restricciones | Notas |
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
-| `idempotency_key` | `text` | `NOT NULL`, `UNIQUE` | Ej.: `order:42:claimed:courier:7`, `order:42:delete:<wa_message_id>`, `daily_report:2026-10-09:v2:5491100000000`. |
+| `idempotency_key` | `text` | `NOT NULL`, `UNIQUE` | Ej.: `order:42:courier_order_assigned:e130` (id del `order_event` de la transición, ver docs/06), `order:42:courier_order_already_taken:courier:7`, `order:42:delete:<wa_message_id>`, `daily_report:2026-10-09:v2:5491100000000`. |
 | `template_key` | `text` | `NOT NULL` | Clave del [catálogo](07-catalogo-mensajes.md). |
 | `message_type` | `text` | `NOT NULL DEFAULT 'text'`, `CHECK (message_type IN ('text','document','delete','edit'))` | `delete`: eliminar para todos un mensaje propio; `edit`: editar un mensaje propio (respaldo de la eliminación). |
 | `recipient_jid` | `text` | `NOT NULL` | |

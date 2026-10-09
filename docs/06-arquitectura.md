@@ -199,8 +199,72 @@ procesando ya fue renovado en el paso 2 y no vence.
 
 Pendiente para la etapa 4b (`TODO(stage-4b)`): clasificar al remitente y dar de alta locales (`identity`,
 `@lid`), conectar la ruta `private_text` con `drafts.handle_store_text` (fuera de la transacción que bloquea el
-evento entrante, marcándolo procesado con `finalize` en la transacción del paso 4), los efectos de los comandos (T06-T08),
+evento entrante, marcándolo procesado con `finalize` en la transacción del paso 4),
 `store_help` con su espera, `store_unsupported_media` y el control de horario `is_accepting_orders` (RN-18).
+Los efectos de `sí`, `no` y `cancelar` (T06-T08, T16, T17) ya están (etapa 5a/6a, ver abajo).
+
+#### Publicación, toma, liberación y cancelación (etapas 5a y 6a)
+
+El núcleo vive en `ya_voy/orders` y no depende de Evolution: recibe eventos ya normalizados
+(`ReactionAdded(group_message_id, courier_id, emoji, inbound_event_id)` y
+`ReactionRemoved(group_message_id, courier_id, inbound_event_id)`, con el motero ya resuelto) y los comandos
+del local ya reconocidos. Cada operación corre dentro de una transacción corta del llamador, no llama a
+Evolution ni a nada lento, y devuelve un `OrderResult(outcome, order_id, outbound_ids)`; los ids se encolan
+después del commit.
+
+| Módulo | Qué hace |
+|--------|----------|
+| `orders/publication.py` | T06/T07 (`publish`, con `is_accepting_orders` en la misma transacción), los ganchos de `send_outbound` sobre mensajes del grupo y la alerta T15 |
+| `orders/claims.py` | T10-T14 por reacción, T18 (`release_by_admin`) |
+| `orders/cancellation.py` | T08, T16, T17 (`cancel_locked`) y la cancelación del administrador (`cancel_by_admin`) |
+| `orders/store_commands.py` | `sí`, `no` y `cancelar` del local (se llama desde `intake.handle_store_text`, bajo el lock del local) |
+| `worker/orders.py` | `handle_reaction(ctx, event)` (una transacción y luego encolar) y la tarea `alert_unclaimed_orders` |
+
+**Guardas.** Son las de docs/03, sin cambios: la toma es el `UPDATE ... WHERE courier_id IS NULL AND
+status = 'published'`; si no devuelve fila, se vuelve a leer el pedido solo para elegir el mensaje (T11 otro
+motero, T12 el mismo, T19 cancelado). La liberación es `UPDATE ... WHERE courier_id = :remitente AND status =
+'assigned'` (T14 si no devuelve fila). La cancelación bloquea la fila (`FOR UPDATE`), lee estado y motero, y hace
+`UPDATE ... WHERE status = :leído`. Orden de locks: fila del pedido y después fila del reporte
+(`mark_report_for_correction`, en la misma transacción que T13, T16, T17 y T18).
+
+**Cancelar contra tomar.** Si la toma confirma primero, la cancelación lee `assigned` (T17: se avisa al motero
+con `courier_order_cancelled`). Si la cancelación toma la fila primero, el `UPDATE` de la toma espera y al
+seguir encuentra `cancelled` (T19: `courier_order_no_longer_available`, una vez por motero y pedido).
+
+**`group_message_id`.** Se guarda cuando Evolution acepta la publicación (gancho
+`publication.on_group_message_sent`, dentro de la transacción de `send_outbound`, con la fila del pedido
+bloqueada); ahí también se reinicia `unclaimed_alert_at` (CU-03 4a). Hasta entonces ninguna reacción puede
+apuntar al pedido. Si el mensaje del grupo se envía después de que el pedido se canceló (estaba en la bandeja
+cuando se canceló), el mismo gancho encola su eliminación. Al eliminarse la publicación se guarda
+`group_post_deleted_at` y el evento `group_post_deleted`; si la eliminación falla del todo, el evento
+`group_post_delete_failed` y la alerta genérica `admin_outbound_failed`.
+
+**Cancelación.** Se eliminan la publicación y todas las respuestas del bot sobre el pedido en el grupo que ya
+tienen id de WhatsApp (T16 y T17, RN-20).
+
+**Claves de la bandeja de salida.**
+
+| Mensajes | Clave |
+|----------|-------|
+| De una transición (toma, liberación, cancelación) | `order:{id}:{template_key}:e{order_event_id}` |
+| Una vez por motero y pedido (T11, T19) | `order:{id}:{template_key}:courier:{courier_id}` |
+| Publicación y confirmación al local | `order:{id}:group_order_post:post`, `order:{id}:store_order_published:post` |
+| Eliminación en el grupo | `order:{id}:delete:{wa_message_id}` |
+| Respuesta a un comando | `{template_key}:{request_key}` (`inbound:{id}`, `msg:{wa_message_id}` o `local:{uuid}`) |
+| T07 y reenvío del resumen | `order:{id}:store_order_not_sent_closed:{request_key}`, `order:{id}:store_order_confirm_request_resend:{request_key}` |
+| Alerta T15 | `order:{id}:admin_order_unclaimed:{inicio del período en UTC}:{teléfono}` |
+
+**Eventos repetidos.** Un evento con `inbound_event_id` que ya tiene una fila en `order_events` de ese pedido se
+ignora (`duplicate`): una quita de reacción reentregada después de una nueva toma no la libera.
+
+Pendiente para la etapa 5b (`TODO(stage-5b)`): convertir los payloads de Evolution (reacción, quita, cambio de
+emoji) en estos eventos con el número de prueba, dar de alta o fusionar al motero por número o `@lid`
+(docs/05) y llamar a `orders.apply_reaction` en la transacción del evento entrante
+(`worker/inbound.py`); confirmar que Evolution entrega mensajes privados a un `@lid`
+(`notify.courier_jid`). Pendiente para la etapa 6b (`TODO(stage-6b)`): verificar la eliminación y la edición
+con el número de prueba y, si la eliminación falla, editar (`group_order_cancelled_edit`) y luego responder
+citando (`group_order_cancelled`). Pendiente para la etapa 7b (`TODO(stage-7b)`): llamar a
+`cancel_by_admin` / `release_by_admin` desde el texto del administrador.
 
 #### Horario y cambios de horario (etapa 7a)
 
@@ -405,6 +469,8 @@ administrador, salvo que el mensaje fallido sea esa misma alerta. El backoff vig
 | D-15 | Cancelar contra tomar se resuelve con `SELECT ... FOR UPDATE` + `UPDATE` condicional sobre el estado leído | El motero recibe aviso de cancelación si y solo si llegó a tener el pedido. |
 | D-16 | Día operativo (`business_date`) con corte a `BUSINESS_DAY_ROLLOVER_TIME` | Las aperturas después de medianoche siguen perteneciendo al día que las originó, también en el reporte. |
 | D-17 | Reporte versionado (`report_revisions`) con correcciones por diferencia neta | Los cambios posteriores al envío se informan sin reescribir lo enviado ni mandar correcciones vacías. |
+| D-18 | Claves de idempotencia de las transiciones con el id del `order_event` | Liberar y volver a tomar avisa de nuevo; un reintento de la misma transición no puede duplicar mensajes. |
+| D-19 | `group_message_id` se guarda cuando Evolution acepta la publicación | Solo se puede reaccionar a un mensaje que existe; el gancho serializa con la cancelación y elimina publicaciones tardías. |
 
 ## 3. Entorno de desarrollo (Docker Compose)
 
