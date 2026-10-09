@@ -49,7 +49,7 @@ erDiagram
 
     stores {
         bigint id PK
-        text wa_jid UK "chat jid used to reply"
+        text wa_jid UK "chat jid used to reply; NULL once anonymized"
         text phone UK "nullable"
         text lid UK "nullable"
         text display_name "from pushName"
@@ -58,6 +58,7 @@ erDiagram
         timestamptz out_of_hours_replied_at
         timestamptz created_at
         timestamptz updated_at
+        timestamptz anonymized_at
     }
 
     couriers {
@@ -70,6 +71,7 @@ erDiagram
         timestamptz first_seen_at
         timestamptz last_seen_at
         timestamptz updated_at
+        timestamptz anonymized_at
     }
 
     orders {
@@ -254,7 +256,7 @@ Alta automática con el primer mensaje privado de un remitente que no es adminis
 | Columna | Tipo | Restricciones | Notas |
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
-| `wa_jid` | `text` | `NOT NULL`, `UNIQUE` | JID del chat privado tal como llega (`5491155551234@s.whatsapp.net` o `xxxx@lid`); se usa para responder. |
+| `wa_jid` | `text` | `UNIQUE`, nullable solo si está anonimizado (`stores_has_identity`) | JID del chat privado tal como llega (`5491155551234@s.whatsapp.net` o `xxxx@lid`); se usa para responder. |
 | `phone` | `text` | `UNIQUE`, nullable | Número si se puede resolver (del JID o de campos alternativos como `remoteJidAlt`/`senderPn`). |
 | `lid` | `text` | `UNIQUE`, nullable | `@lid` si se conoce. |
 | `display_name` | `text` | `NOT NULL` | `pushName`; se actualiza cuando cambia. Si llega vacío: `STORE_FALLBACK_NAME` ("Local"). |
@@ -262,8 +264,16 @@ Alta automática con el primer mensaje privado de un remitente que no es adminis
 | `last_message_at` | `timestamptz` | nullable | |
 | `out_of_hours_replied_at` | `timestamptz` | nullable | Para el límite de frecuencia de `store_out_of_hours`. |
 | `created_at`, `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): sin actividad en `DATA_RETENTION_DAYS`; `wa_jid`, `phone` y `lid` en `NULL`, `display_name` = `STORE_FALLBACK_NAME`. |
+
+```sql
+ALTER TABLE stores ADD CONSTRAINT stores_has_identity
+    CHECK (anonymized_at IS NOT NULL OR wa_jid IS NOT NULL);
+```
 
 Búsqueda del remitente: `WHERE wa_jid = :jid OR lid = :lid OR phone = :phone` (con los valores disponibles).
+Nunca encuentra un local anonimizado (sus identificadores son `NULL`): quien vuelve se da de alta como un
+local nuevo (docs/06, "Identidades inactivas"). El alta debe actualizar `last_message_at`.
 
 ### `couriers`
 
@@ -278,11 +288,15 @@ Alta automática con la primera reacción a una publicación de pedido.
 | `display_name` | `text` | `NOT NULL` | `pushName`; se actualiza cuando cambia. Si nunca llegó: `COURIER_FALLBACK_NAME` ("Motero"). |
 | `is_blocked` | `boolean` | `NOT NULL DEFAULT false` | |
 | `first_seen_at`, `last_seen_at`, `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): sin actividad en `DATA_RETENTION_DAYS`; `lid`, `phone_jid` y `phone` en `NULL`, `display_name` = `COURIER_FALLBACK_NAME`. |
 
 ```sql
 ALTER TABLE couriers ADD CONSTRAINT couriers_has_identity
-    CHECK (lid IS NOT NULL OR phone_jid IS NOT NULL);
+    CHECK (anonymized_at IS NOT NULL OR lid IS NOT NULL OR phone_jid IS NOT NULL);
 ```
+
+Un motero anonimizado no aparece en la resolución de abajo (sus identificadores son `NULL`): vuelve como
+un registro nuevo, sin fusión con el anterior (docs/06, "Identidades inactivas").
 
 Resolución de un participante (dentro de la transacción del evento):
 
@@ -402,7 +416,7 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 | `error` | `text` | nullable | |
 | `received_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 | `processed_at` | `timestamptz` | nullable | |
-| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `payload` queda `{}` y `error` nulo. |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `payload` queda `{}`, `error` nulo; `remote_jid` y `participant` nulos salvo grupos y `ADMIN_PHONES`. |
 
 Índices: `(status, received_at) WHERE status IN ('received','failed')` para el barrido de recuperación;
 `inbound_events_retention_idx (received_at) WHERE anonymized_at IS NULL`.
@@ -457,7 +471,7 @@ toca ni borra filas (docs/06, "Retención de datos").
 | `inbound_event_id` | `bigint` | FK → `inbound_events.id`, nullable | Si `direction = 'in'`. |
 | `outbound_message_id` | `bigint` | FK → `outbound_messages.id`, nullable | Si `direction = 'out'`. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
-| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` nulo. |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` y `sender_jid` nulos, `chat_jid` vacío (salvo grupos y `ADMIN_PHONES`). |
 
 Índices: `(chat_jid, created_at)`, `(order_id)`, `(wa_message_id)`,
 `messages_retention_idx (created_at) WHERE anonymized_at IS NULL`.
@@ -492,7 +506,7 @@ ALTER TABLE messages ADD CONSTRAINT messages_outbound_message_only_out
 | `wa_message_id` | `text` | nullable | `key.id` devuelto por Evolution. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 | `sent_at` | `timestamptz` | nullable | |
-| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` queda vacío y `last_error` nulo. |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` vacío, `last_error` nulo, `recipient_jid` vacío (salvo grupos y `ADMIN_PHONES`), `idempotency_key` = `anonymized:<id>`. |
 
 Índices: `(status, created_at) WHERE status IN ('pending','failed')`, `(wa_message_id)`,
 `(recipient_jid, id) WHERE status IN ('pending','sending')` (orden FIFO por destinatario),
@@ -551,7 +565,7 @@ Cada versión del reporte. La revisión 1 es el original; las siguientes son cor
 | `last_error` | `text` | nullable | |
 | `generated_at`, `sent_at` | `timestamptz` | nullable | |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
-| `anonymized_at` | `timestamptz` | nullable | Retención: `file_content` borrado (el archivo tiene direcciones). |
+| `anonymized_at` | `timestamptz` | nullable | Retención: `file_content` borrado (el archivo tiene direcciones); nombres de moteros de `snapshot`/`changes` = `COURIER_FALLBACK_NAME`. |
 
 Cálculo de cambios (`diff_snapshots(previous, current)`), por pedido publicado del día:
 
@@ -609,7 +623,7 @@ Cada instrucción de horario del administrador, con su interpretación y su cicl
 | `cancelled_at` | `timestamptz` | nullable | Levantado por un `reopen`. |
 | `cancelled_by_override_id` | `bigint` | FK → `schedule_overrides.id`, nullable | El `reopen` que lo levantó. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
-| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `source_text` vacío, `parsed` `{}`, `reason` nulo. |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `source_text` vacío, `parsed` `{}`, `reason` nulo, `created_by` vacío si no está en `ADMIN_PHONES`. |
 
 Restricciones e índices:
 

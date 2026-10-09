@@ -40,3 +40,23 @@ flujos vivos; y las capturas de desarrollo viejas de `CAPTURE_DIR` se borran del
 columnas se vacían y cuáles se conservan; que correr la tarea dos veces no cambia nada; que el reporte de un
 día ya anonimizado sigue dando los mismos conteos; y que no se bloquea a la toma de pedidos (lotes con
 `FOR UPDATE SKIP LOCKED`).
+
+## 2. Retención de identidades inactivas — hecha
+
+**Requisitos:** RNF-10 y RNF-09 (docs/01): los locales y moteros sin actividad en `DATA_RETENTION_DAYS`
+(90) días pierden teléfono, nombre, JID y `lid`; también se borran los JID y nombres que quedaban en filas
+viejas (`participant`, `sender_jid`, `chat_jid`, `recipient_jid`, `remote_jid`, `created_by`,
+`idempotency_key`, nombres en `report_revisions.snapshot`/`changes`). Aprobado por el cliente como
+continuación de la sección 1.
+
+**Estado:** hecha (rama `retention-inactive-identities`). Categorías `stores` y `couriers` en
+`ya_voy/retention/service.py` (después de las filas, en la misma corrida), migración `0005`
+(`anonymized_at` en `stores` y `couriers`, `stores.wa_jid` nullable, checks `*_has_identity` que solo
+admiten la falta de identificadores en filas anonimizadas; además desmarca las filas que la sección 1 ya
+había anonimizado para que la próxima corrida les aplique el borrado de JID), tests en
+`tests/integration/test_retention_identities.py`. Definición de actividad, exclusiones (`ADMIN_PHONES`,
+bloqueados, flujos vivos) y el regreso como registro nuevo en docs/06, "Identidades inactivas" (D-21).
+
+**Para las etapas 4b/5b:** el alta y la resolución de remitentes deben actualizar
+`stores.last_message_at` / `couriers.last_seen_at` y buscar con `FOR UPDATE` (docs/05), así una
+anonimización simultánea termina en un registro nuevo y no en uno a medias.

@@ -476,18 +476,63 @@ Límites (con `db_now()`): `cutoff = now - DATA_RETENTION_DAYS` para las marcas 
 |-----------|-------|----------|------------------------------|
 | `orders` | `business_date` anterior al límite | `pickup_address`, `delivery_address`, `product`, `payment_method_raw`, `notes` (a `NULL`), `extraction` (`{}`), `validation_errors` (`[]`) | Pedidos pendientes (`draft`, `awaiting_confirmation`, `published`); pedidos de un día cuyo reporte no está `sent` ni `failed` (todavía puede corregirse). |
 | `order_events` | `created_at` anterior al límite | Claves `extraction`, `admin_jid` y `error` de `data` (se conservan emoji, campos cambiados, etc.) | Eventos de pedidos pendientes. |
-| `inbound_events` | `received_at` anterior al límite | `payload` (`{}`), `error` | Eventos `received` o `processing`. Los `failed` viejos se anonimizan y ya no se pueden reprocesar. |
-| `messages` | `created_at` anterior al límite | `body` | Mensajes de pedidos pendientes. |
-| `outbound_messages` | `created_at` anterior al límite | `body` (`''`), `last_error` | Filas `pending` o `sending`. |
-| `schedule_overrides` | `created_at` anterior al límite | `source_text` (`''`), `parsed` (`{}`), `reason` | `pending_confirmation`; cambios `active` todavía vigentes (sin fin, o que terminan después del límite). |
-| `report_revisions` | revisiones de reportes con `report_date` anterior al límite | `file_content` (el `.xlsx`, que tiene direcciones) | Reportes que no están `sent`/`failed`; revisiones con un documento en la bandeja de salida `pending`/`sending`. |
+| `inbound_events` | `received_at` anterior al límite | `payload` (`{}`), `error`, `remote_jid` y `participant` (JID personales, ver abajo) | Eventos `received` o `processing`. Los `failed` viejos se anonimizan y ya no se pueden reprocesar. |
+| `messages` | `created_at` anterior al límite | `body`, `chat_jid` (`''`) y `sender_jid` (JID personales) | Mensajes de pedidos pendientes. |
+| `outbound_messages` | `created_at` anterior al límite | `body` (`''`), `last_error`, `recipient_jid` (`''`, JID personal) e `idempotency_key` (`anonymized:<id>`: algunas claves llevan el JID del remitente) | Filas `pending` o `sending`. |
+| `schedule_overrides` | `created_at` anterior al límite | `source_text` (`''`), `parsed` (`{}`), `reason`, `created_by` (`''` si ya no está en `ADMIN_PHONES`) | `pending_confirmation`; cambios `active` todavía vigentes (sin fin, o que terminan después del límite). |
+| `report_revisions` | revisiones de reportes con `report_date` anterior al límite | `file_content` (el `.xlsx`, que tiene direcciones y teléfonos); en `snapshot` y `changes`, los nombres de moteros pasan a `COURIER_FALLBACK_NAME` (se conservan códigos, estados y `courier_id`) | Reportes que no están `sent`/`failed`; revisiones con un documento en la bandeja de salida `pending`/`sending`. |
+| `stores`, `couriers` | identidades sin actividad dentro de la ventana (ver "Identidades inactivas") | Todos los identificadores: `wa_jid`, `phone`, `lid` (locales) y `lid`, `phone_jid`, `phone` (moteros) a `NULL`; `display_name` pasa a `STORE_FALLBACK_NAME` / `COURIER_FALLBACK_NAME` | Números de `ADMIN_PHONES`, identidades bloqueadas (`is_blocked`) y cualquier identidad con actividad o referenciada por un flujo vivo. |
 
-Se conservan a propósito: `participant`, `sender_jid`, `recipient_jid`, `created_by` y las tablas `stores` y
-`couriers` (identidad viva del local o motero, no texto del día), `report_revisions.snapshot`/`changes`
-(solo códigos, estados y nombres de moteros; base de las correcciones), `file_name` (sin datos personales)
-y `parked_reactions` (no tiene datos personales: emoji, ids del mensaje, `courier_id`). El reporte de un
+**JID y teléfonos en filas viejas.** Un JID (`549...@s.whatsapp.net` o `@lid`) identifica a una persona,
+así que en las filas pasadas la ventana se vacía siempre, aunque la identidad siga activa (nada vivo los
+lee). Se conservan solo los JID de grupo (`@g.us`, no son personas) y los de `ADMIN_PHONES` (el número del
+operador, que ya está en la configuración y que el reenvío manual del reporte necesita: compara
+destinatarios de los documentos). Se conservan a propósito: ids, `wa_message_id` (id del mensaje, no de la
+persona), `file_name` (sin datos personales), los códigos, estados y `courier_id` de
+`snapshot`/`changes` (base de una corrección: se compara por `courier_id`) y `parked_reactions` (no tiene
+datos personales: emoji, ids del mensaje, `courier_id`). El reporte de un
 día anonimizado ya no tiene archivo: un reenvío manual lo rearma desde los datos anonimizados (ver "Sin
 archivo" más arriba).
+
+##### Identidades inactivas
+
+Un local o motero sin actividad dentro de la ventana se anonimiza: se borran todos sus identificadores
+(JID, `lid`, teléfono) y el nombre pasa al genérico. La fila queda, con su `id`, así los pedidos, eventos y
+reportes viejos siguen apuntando a ella y sumando igual (en el reporte aparece como "Motero" / "Local", sin
+teléfono). No hay tablas de alias aparte: los identificadores viven solo en `stores` y `couriers`.
+
+**Actividad** (se calcula con datos existentes; no hizo falta una columna nueva). Una identidad está activa
+si se cumple cualquiera de estas condiciones:
+
+- Local: `created_at` o `last_message_at` dentro de la ventana; o algún `orders` (`store_id`), `messages`
+  (`store_id`), `inbound_events` (`remote_jid` igual a su `wa_jid` o `lid`) o `outbound_messages`
+  (`recipient_jid` igual a su `wa_jid` o `lid`) todavía sin anonimizar.
+- Motero: `first_seen_at` o `last_seen_at` dentro de la ventana; o algún `orders` (`courier_id` o
+  `last_courier_id`), `order_events` (`courier_id`, o `actor_type = 'courier'` con su `actor_id`),
+  `messages` (`courier_id`), `inbound_events` (`participant` o `remote_jid` igual a su `lid` o
+  `phone_jid`) o `outbound_messages` (`recipient_jid` igual a su `lid` o `phone_jid`) todavía sin
+  anonimizar; o una `parked_reactions` pendiente o creada dentro de la ventana.
+
+Una fila sin anonimizar es, por construcción, de la ventana (mensaje, reacción, toma, pedido) o protegida
+por un flujo vivo (pedido pendiente o de un día cuyo reporte todavía puede corregirse, bandeja de salida sin
+enviar, evento entrante sin terminar). Por eso las identidades se procesan **después** de las filas, en la
+misma corrida, y "sin referencias vivas" cubre las dos cosas: actividad reciente y flujos vivos. Las etapas
+4b y 5b, al registrar o reconocer a alguien, deben actualizar `stores.last_message_at` y
+`couriers.last_seen_at` (hoy ningún flujo lo hace; las referencias de arriba ya alcanzan).
+
+Nunca se anonimizan: los números de `ADMIN_PHONES` (por `phone` o por JID; un administrador conocido solo por
+`@lid` no se puede reconocer) ni las identidades bloqueadas (`is_blocked`): anonimizar un bloqueo lo
+levantaría, porque la persona volvería como un registro nuevo sin bloquear.
+
+**Volver después de la anonimización.** Los identificadores quedan en `NULL` (`UNIQUE` admite muchos
+`NULL`; los checks `stores_has_identity` y `couriers_has_identity` solo permiten la falta de identificadores
+en filas con `anonymized_at`). La búsqueda del remitente (docs/05: por `wa_jid`, `lid` o teléfono) no
+encuentra la fila anonimizada, así que la persona se registra como un local o motero **nuevo** por el alta
+automática habitual; los datos viejos siguen apuntando al registro anonimizado y no se fusionan. Si el alta
+y la retención coinciden, la búsqueda con `FOR UPDATE` (docs/05) espera el lote de la retención, vuelve a
+evaluar la fila (ya sin identificadores) y crea una nueva; si el alta llegó primero, la retención la saltea
+(`SKIP LOCKED`) y vuelve a evaluarla en la próxima corrida. Por las dudas, `Outbox.add` descarta (con una
+advertencia en el log) un mensaje a un motero o local sin JID en lugar de fallar.
 
 Cada categoría avanza por lotes de `DATA_RETENTION_BATCH_SIZE` filas, una transacción corta por lote:
 `WITH batch AS (SELECT id ... WHERE anonymized_at IS NULL AND <condición> ORDER BY id LIMIT :n FOR UPDATE
@@ -545,6 +590,7 @@ administrador, salvo que el mensaje fallido sea esa misma alerta. El backoff vig
 | D-18 | Claves de idempotencia de las transiciones con el id del `order_event` | Liberar y volver a tomar avisa de nuevo; un reintento de la misma transición no puede duplicar mensajes. |
 | D-19 | `group_message_id` se guarda cuando Evolution acepta la publicación; las reacciones que llegan antes se estacionan y el gancho las aplica primero, en orden de `messageTimestamp` | Solo se puede reaccionar a un mensaje que existe, pero la primera reacción gana aunque llegue antes del commit del id; el gancho serializa con la cancelación y elimina publicaciones tardías. |
 | D-20 | La retención anonimiza sin borrar filas, por lotes con `FOR UPDATE SKIP LOCKED` y marca `anonymized_at` | Los conteos de reportes viejos no cambian; la tarea es idempotente y nunca bloquea la toma de pedidos. |
+| D-21 | Las identidades sin actividad en `DATA_RETENTION_DAYS` pierden todos sus identificadores; quien vuelve es un registro nuevo | Los datos personales no sobreviven a la ventana y los reportes viejos siguen sumando con el registro anonimizado; los administradores y bloqueados se conservan. |
 
 ## 3. Entorno de desarrollo (Docker Compose)
 
