@@ -58,7 +58,9 @@ make format       # ruff --fix + format
 ```
 
 Full suite in Docker, including integration tests against the compose Postgres/Redis:
-`make test-docker`. New migrations (stage 2 onwards):
+`make test-docker`. Failed inbound events: `make reprocess ids="12 15"` (or `ids=--all`).
+Without an LLM key, `LLM_PROVIDER=fake` gives a deterministic, offline extractor for development.
+New migrations (stage 2 onwards):
 `make revision m="create orders"`, then `make migrate`.
 
 All settings are environment variables (see [`.env.example`](.env.example) and

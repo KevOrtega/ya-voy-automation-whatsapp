@@ -107,7 +107,8 @@ ya_voy/
 - **`llm`** define dos interfaces: `OrderExtractor.extract(text, current) -> OrderExtraction` y
   `ScheduleIntentParser.parse(text, now, base_hours) -> ScheduleOverrideIntent`. La implementación concreta usa
   un cliente compatible con varios proveedores (por ejemplo `pydantic-ai`, `instructor` o `litellm`; se elige al
-  implementar). Proveedor y modelo por configuración (RNF-13). El LLM nunca decide: su salida se valida con
+  implementar; la etapa 4a usa `httpx` directo contra la API de Chat Completions compatible con OpenAI,
+  `ya_voy/llm/openai_compatible.py`). Proveedor y modelo por configuración (RNF-13). El LLM nunca decide: su salida se valida con
   código y, en el caso del horario, además la confirma el administrador.
 - **`whatsapp`** encapsula el formato de Evolution: normaliza números, JID y `@lid` (incluidos los campos
   alternativos), detecta reacciones (`message.reactionMessage`, con `text` vacío = remoción) y mensajes
@@ -138,7 +139,38 @@ después de guardar, igual responde `200` y el barrido `recover_inbound_events` 
 
 Si `process_inbound_event` falla, el evento queda en `inbound_events.status = 'failed'` con `error` y se
 registra en el log a nivel `ERROR` con `inbound_event_id` y el error. No se reintenta solo (el barrido
-toma solo `received`). La etapa 4 agrega un comando manual para reprocesar eventos fallidos.
+toma solo `received`). Para reprocesarlos, después de corregir la causa:
+
+```bash
+make reprocess ids="12 15"   # esos eventos, si siguen en failed
+make reprocess ids=--all     # todos los eventos en failed
+```
+
+(`python -m scripts.reprocess_inbound` dentro del `worker`). Pasa a `received` solo los que siguen en
+`failed` (un `UPDATE` condicional, así que repetirlo no hace nada), borra `error` y `processed_at`, conserva
+`attempts` como historial y los encola de nuevo.
+
+#### Toma de pedidos (etapa 4a)
+
+`ya_voy/worker/intake.py` recibe el texto de un local ya identificado (`StoreText`) y hace T01, T02 y T05:
+bloquea el borrador abierto con `SELECT ... FOR UPDATE`, llama a `OrderExtractor`, une los campos (lo nuevo no
+vacío reemplaza; `payment_method` lo decide el diccionario de `ya_voy/domain/payment.py` cuando hay texto de
+pago) y renueva `draft_expires_at = now() + DRAFT_TTL_MINUTES`. Si el local no tiene borrador, lo crea con
+`INSERT ... ON CONFLICT DO NOTHING` sobre `orders_one_draft_per_store`; si otro mensaje simultáneo ganó, bloquea
+ese borrador y une ahí (RN-09, sin lock de Redis). Los comandos (`sí`, `no`, `cancelar`, `ayuda`) no pasan por
+el LLM. Si el LLM falla, el borrador queda igual y se envían `store_processing_error` y `admin_llm_failure`.
+
+Después del commit se encola `evaluate_draft(order_id)` diferido `DRAFT_DEBOUNCE_SECONDS` (RF-15). Si llegó otro
+mensaje en ese lapso, la evaluación se descarta (la del mensaje nuevo evalúa después). Con campos faltantes envía
+`store_order_missing_fields` (y `store_order_format_example` desde el pedido número `MAX_MISSING_FIELDS_PROMPTS`);
+completo, pasa a `awaiting_confirmation` (T04) y envía `store_order_confirm_request`. Las claves de la bandeja de
+salida incluyen la revisión del borrador (`last_store_message_at`), así que evaluar dos veces lo mismo no
+duplica mensajes. `expire_drafts` (T09) es un `UPDATE` condicional: un mensaje que renueva el borrador tiene el
+bloqueo de la fila y gana.
+
+Pendiente para la etapa 4b (`TODO(stage-4b)`): clasificar al remitente y dar de alta locales (`identity`,
+`@lid`), conectar la ruta `private_text` con `drafts.handle_store_text`, los efectos de los comandos (T06-T08),
+`store_help` con su espera, `store_unsupported_media` y el control de horario `is_accepting_orders` (RN-18).
 
 #### Política de reintentos de la bandeja de salida
 
@@ -275,9 +307,9 @@ Consideraciones:
 | `WEBHOOK_SECRET` | — | Secreto en la ruta del webhook. |
 | `COURIERS_GROUP_JID` | `1203630xxxxxxxx@g.us` | Grupo de moteros; cualquier otro grupo se ignora. |
 | `ADMIN_PHONES` | `5491100000000` | Número(s) del administrador, separados por coma: alertas, reporte, comandos y cambios de horario. |
-| `LLM_PROVIDER` | `openai` | Proveedor de LLM. |
-| `LLM_MODEL` | — | Modelo para extracción. |
-| `LLM_API_KEY` | — | |
+| `LLM_PROVIDER` | `openai` | Proveedor de LLM: `openai` (u `openai-compatible`, cualquier API compatible con Chat Completions de OpenAI y salida `json_schema`) o `fake` (solo desarrollo: extractor determinístico por etiquetas `Campo: valor`, sin red). |
+| `LLM_MODEL` | — | Modelo para extracción. Obligatorio con `openai`. |
+| `LLM_API_KEY` | — | Obligatorio con `openai`. Sin él el worker arranca igual, registra `LLM not configured` en `ERROR` y cada pedido recibe `store_processing_error` (y los administradores `admin_llm_failure`). Los tests nunca lo usan. |
 | `LLM_BASE_URL` | vacío | Para proveedores compatibles con OpenAI o modelos propios. |
 | `LLM_TIMEOUT_SECONDS` | `20` | |
 | `LLM_MAX_RETRIES` | `3` | |
