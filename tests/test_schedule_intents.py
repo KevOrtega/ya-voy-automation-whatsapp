@@ -161,6 +161,93 @@ def test_closed_today_after_hours_changes_nothing() -> None:
     assert validate(intent(K.CLOSED_TODAY), at(9, 23, 30), [until_one]).ends_at == at(10, 5)
 
 
+# --- most recent wins (RF-08, RN-25) -----------------------------------------------------------
+
+RAIN = override(K.CLOSED_TODAY, at(9, 10), at(10, 5), reason="lluvia", confirmed_at=at(9, 10), id=1)
+
+
+def test_opening_after_closed_today_is_valid_and_replaces_it() -> None:
+    """The auditor's example: closed at 10:00, at 18:00 "abrimos de 19 a 23" (inside the base)."""
+    p = validate(intent(K.OPEN_WINDOW, start_time=t(19), end_time=t(23)), at(9, 18), [RAIN])
+    assert (p.starts_at, p.ends_at, p.replaced) == (at(9, 19), at(9, 23), [RAIN])
+
+
+def test_opening_after_until_further_notice_is_valid_and_replaces_it() -> None:
+    forever = override(K.CLOSED_UNTIL_FURTHER_NOTICE, at(8, 21), None, confirmed_at=at(8, 21), id=2)
+    p = validate(intent(K.OPEN_WINDOW, start_time=t(19), end_time=t(1)), at(9, 18), [forever])
+    assert (p.starts_at, p.ends_at, p.replaced) == (at(9, 19), at(10, 1), [forever])
+
+
+def test_opening_of_hours_already_open_is_still_invalid() -> None:
+    window = override(K.CLOSED_WINDOW, at(9, 15), at(9, 16), confirmed_at=at(9, 10), id=3)
+    i = intent(K.OPEN_WINDOW, start_time=t(19), end_time=t(23))
+    assert invalid(i, at(9, 18), [window]) == InvalidCode.OPEN_INSIDE_BASE
+    # Only the part from now on counts: the closed 15-16 is already past at 18:00.
+    early = intent(K.OPEN_WINDOW, start_time=t(15), end_time=t(19))
+    assert invalid(early, at(9, 18), [window]) == InvalidCode.OPEN_INSIDE_BASE
+
+
+def test_closures_replace_the_openings_they_overlap() -> None:
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(9, 23), confirmed_at=at(9, 18), id=4)
+    late = override(K.OPEN_WINDOW, at(9, 23), at(10, 1), confirmed_at=at(9, 11), id=5)
+    overrides = [RAIN, opening, late]
+    window = validate(
+        intent(K.CLOSED_WINDOW, start_time=t(20), end_time=t(21)), at(9, 19, 30), overrides
+    )
+    assert (window.starts_at, window.ends_at, window.replaced) == (at(9, 20), at(9, 21), [opening])
+    today = validate(intent(K.CLOSED_TODAY), at(9, 19, 30), overrides)
+    assert today.replaced == [late, opening]  # both confirmed after RAIN, in that order
+    tomorrow = override(
+        K.OPEN_WINDOW, at(10, 7), at(10, 9), day=TOMORROW, confirmed_at=at(9, 12), id=6
+    )
+    forever = validate(intent(K.CLOSED_UNTIL_FURTHER_NOTICE), NOON, [late, tomorrow])
+    assert forever.replaced == [late, tomorrow]
+
+
+def test_closed_window_over_hours_a_later_opening_reopened_is_valid() -> None:
+    """Window clipping uses the current effective hours, which follow most-recent-wins."""
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(9, 23), confirmed_at=at(9, 18), id=4)
+    i = intent(K.CLOSED_WINDOW, start_time=t(18), end_time=t(21))
+    assert invalid(i, at(9, 17), [RAIN]) == InvalidCode.CLOSURE_OUTSIDE_HOURS
+    p = validate(i, at(9, 18, 30), [RAIN, opening])
+    assert (p.starts_at, p.ends_at) == (at(9, 19), at(9, 21))
+
+
+def test_summary_of_an_opening_says_what_it_replaces() -> None:
+    p = validate(intent(K.OPEN_WINDOW, start_time=t(19), end_time=t(23)), at(9, 18), [RAIN])
+    view = p.as_view()
+    summary = texts.override_summary(
+        view,
+        S,
+        effective_hours_text=texts.effective_hours(effective_intervals(S, [RAIN, view], D), S),
+        report_note_text=texts.report_note(
+            None, window_end=at(9, 23), current_due_at=at(9, 23), settings=S
+        ),
+        replaced=p.replaced,
+    )
+    assert summary == (
+        "El 09/10/2026 se toman pedidos también de 19:00 a 23:00. "
+        "Horario de ese día: 09:00 a 10:00 y 19:00 a 23:00. "
+        "Reemplaza, en el horario que se superpone: cierre de hoy por lluvia."
+    )
+
+
+def test_summary_of_a_closure_says_which_openings_it_replaces() -> None:
+    late = override(K.OPEN_WINDOW, at(9, 23), at(10, 1), confirmed_at=at(9, 11), id=5)
+    p = validate(intent(K.CLOSED_TODAY, reason="lluvia"), NOON, [late])
+    assert texts.override_summary(p.as_view(starts_at=NOON), S, replaced=p.replaced) == (
+        "Hoy 09/10/2026 no se toman más pedidos (motivo: lluvia). "
+        "Reemplaza, en el horario que se superpone: apertura del 09/10/2026 de 23:00 a "
+        "01:00 (del 10/10)."
+    )
+    both = [RAIN, override(K.CLOSED_WINDOW, at(9, 21), at(9, 22), confirmed_at=at(9, 11), id=7)]
+    opening = validate(intent(K.OPEN_WINDOW, start_time=t(19), end_time=t(23)), at(9, 18), both)
+    assert texts.replaced_note(opening.replaced, S) == (
+        "Reemplaza, en el horario que se superpone: cierre de hoy por lluvia, "
+        "cierre de 21:00 a 22:00."
+    )
+
+
 # --- rollover at 05:00 -------------------------------------------------------------------------
 
 

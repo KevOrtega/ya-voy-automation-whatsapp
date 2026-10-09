@@ -48,7 +48,9 @@ from ya_voy.schedule.hours import (
     day_bounds,
     decide_acceptance,
     effective_intervals,
+    overridden_in_overlap,
     report_due_at,
+    winning_closures,
 )
 from ya_voy.schedule.intents import (
     NotAScheduleInstructionError,
@@ -162,6 +164,7 @@ async def _summary(
     *,
     to_lift: list[OverrideView] | None = None,
     upcoming: list[OverrideView] | None = None,
+    replaced: list[OverrideView] | None = None,
 ) -> str:
     hours = note = ""
     if view.kind == K.OPEN_WINDOW:
@@ -173,6 +176,7 @@ async def _summary(
         report_note_text=note,
         to_lift=to_lift or [],
         upcoming=upcoming or [],
+        replaced=replaced or [],
     )
 
 
@@ -251,6 +255,7 @@ async def _apply_instruction(
         proposal.as_view(),
         to_lift=proposal.to_lift,
         upcoming=proposal.upcoming,
+        replaced=proposal.replaced,
     )
     ids = await _reply(
         session,
@@ -334,13 +339,19 @@ async def confirm_pending(session: AsyncSession, settings: Settings, msg: AdminT
         await _reopen_daily_report(session, settings, row, overrides_after)
 
     view = OverrideView.of(row)
+    # Recomputed at confirmation: what this instruction overrides now (most recent wins).
+    replaced = overridden_in_overlap(overrides_before, view, now)
     if kind == K.OPEN_WINDOW:
         assert view.business_date is not None
         hours = texts.effective_hours(
             effective_intervals(settings, overrides_after, view.business_date), settings
         )
         summary = texts.override_summary(
-            view, settings, effective_hours_text=hours, report_note_text=report_note_before
+            view,
+            settings,
+            effective_hours_text=hours,
+            report_note_text=report_note_before,
+            replaced=replaced,
         )
     else:
         summary = texts.override_summary(
@@ -348,6 +359,7 @@ async def confirm_pending(session: AsyncSession, settings: Settings, msg: AdminT
             settings,
             to_lift=lifted,
             upcoming=upcoming_closures(settings, overrides_after, now),
+            replaced=replaced,
         )
     status = texts.status_line(decide_acceptance(settings, overrides_after, now))
     ids = await _reply(
@@ -507,17 +519,19 @@ async def expire_schedule_confirmations(session: AsyncSession) -> list[int]:
 
 async def remind_still_closed(session: AsyncSession, settings: Settings) -> list[int]:
     """RF-45 / CU-14 8a: once per business day, from ``BUSINESS_HOURS_START`` on, while a
-    ``closed_until_further_notice`` that started before today's base start is in effect."""
+    ``closed_until_further_notice`` that started before today's base start closes the store (no
+    later opening in effect overrides it at that moment)."""
     now = await db_now(session)
     today = _today(settings, now)
     base_start = at_local(settings, today, settings.business_hours_start)
     if now < base_start:
         return []
     ids: list[int] = []
-    for closure in await load_overrides(session, settings, now):
+    overrides = await load_overrides(session, settings, now)
+    # Only while it actually closes the store: a later opening in effect now overrides it.
+    for closure in winning_closures(overrides, now):
         if not (
             closure.kind == K.CLOSED_UNTIL_FURTHER_NOTICE
-            and closure.in_effect(now)
             and closure.starts_at is not None
             and closure.starts_at < base_start
         ):

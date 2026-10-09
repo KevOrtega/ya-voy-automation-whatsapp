@@ -165,6 +165,9 @@ CLOSURE_ITEMS: dict[str, str] = {
     "closed_window": "cierre de {window_start} a {window_end}{reason_text}",
 }
 NO_EFFECTIVE_HOURS = "cerrado todo el día"
+# Appended to {override_summary} when the new instruction overrides earlier ones (most recent wins).
+REPLACED_NOTE = "Reemplaza, en el horario que se superpone: {items}."
+OPENING_ITEM = "apertura del {date} de {window_start} a {window_end}{reason_text}"
 # {reason} of admin_schedule_invalid. The first three are doc 07's examples.
 SCHEDULE_INVALID_REASONS: dict[str, str] = {
     "open_out_of_bounds": (

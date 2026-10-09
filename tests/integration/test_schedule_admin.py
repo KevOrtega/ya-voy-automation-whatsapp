@@ -50,6 +50,7 @@ REOPEN = "ya tomamos pedidos de nuevo"
 QUESTION = "¿cuántos pedidos hubo hoy?"
 BAD_OPENING = "hoy de 13 a 15 abrimos más"
 UNTIL_ONE = "hoy hasta la 01"
+EVENING = "abrimos de 19 a 23"
 INTENTS = {
     RAIN: ScheduleOverrideIntent(kind=K.CLOSED_TODAY, reason="lluvia"),
     UNTIL_NOTICE: ScheduleOverrideIntent(kind=K.CLOSED_UNTIL_FURTHER_NOTICE),
@@ -65,6 +66,9 @@ INTENTS = {
     ),
     UNTIL_ONE: ScheduleOverrideIntent(
         kind=K.OPEN_WINDOW, start_time=dt.time(23), end_time=dt.time(1)
+    ),
+    EVENING: ScheduleOverrideIntent(
+        kind=K.OPEN_WINDOW, start_time=dt.time(19), end_time=dt.time(23)
     ),
 }
 
@@ -680,10 +684,109 @@ async def test_acceptance_around_the_rollover_from_the_database(
     )
 
 
-# --- precedence with persisted overrides --------------------------------------------------------
+# --- precedence with persisted overrides: the most recently confirmed wins ---------------------
 
 
-async def test_closure_inside_an_opening_wins(ctx: dict[str, Any], clock: Clock) -> None:
+async def test_later_opening_reopens_part_of_closed_today(
+    ctx: dict[str, Any], clock: Clock
+) -> None:
+    """The auditor's example: "hoy no tomamos por lluvia" confirmed at 10:00, then "abrimos de 19
+    a 23" confirmed at 18:00 → open 19-23."""
+    sf = ctx["session_factory"]
+    clock.now = at(9, 10)
+    await say(ctx, RAIN)
+    await say(ctx, "sí")
+    clock.now = at(9, 18)
+    request = await say(ctx, EVENING)
+    assert request.outcome == "confirmation_requested"
+    assert await bodies(sf, request.outbound_ids) == [
+        "Entendí esto:\nEl 09/10/2026 se toman pedidos también de 19:00 a 23:00. "
+        "Horario de ese día: 09:00 a 10:00 y 19:00 a 23:00. "
+        "Reemplaza, en el horario que se superpone: cierre de hoy por lluvia.\n\n"
+        "¿Lo aplico? Respondé *sí* o *no* (tenés 5 minutos)."
+    ]
+    clock.now = at(9, 18, 1)
+    applied = await say(ctx, "sí")
+    assert await bodies(sf, applied.outbound_ids) == [
+        "✅ Listo. El 09/10/2026 se toman pedidos también de 19:00 a 23:00. "
+        "Horario de ese día: 09:00 a 10:00 y 19:00 a 23:00. "
+        "Reemplaza, en el horario que se superpone: cierre de hoy por lluvia.\n"
+        "Ahora: cerrado (lluvia)"
+    ]
+    assert (await accepting(ctx, at(9, 18, 30))).reason == AcceptanceReason.CLOSED
+    assert (await accepting(ctx, at(9, 20))).accepting
+    late = await accepting(ctx, at(9, 23, 30))
+    assert (late.reason, late.closure.kind) == (AcceptanceReason.CLOSED, K.CLOSED_TODAY)
+    [rain, evening] = await overrides(sf)
+    assert (rain.status, evening.status) == ("active", "active")  # nothing is lifted
+
+
+async def test_later_closed_today_closes_an_earlier_opening(
+    ctx: dict[str, Any], clock: Clock
+) -> None:
+    sf = ctx["session_factory"]
+    clock.now = at(9, 10)
+    await say(ctx, UNTIL_ONE)
+    await say(ctx, "sí")
+    clock.now = at(9, 18)
+    request = await say(ctx, RAIN)
+    assert await bodies(sf, request.outbound_ids) == [
+        "Entendí esto:\nHoy 09/10/2026 no se toman más pedidos (motivo: lluvia). "
+        "Reemplaza, en el horario que se superpone: apertura del 09/10/2026 de 23:00 a "
+        "01:00 (del 10/10).\n\n"
+        "¿Lo aplico? Respondé *sí* o *no* (tenés 5 minutos)."
+    ]
+    await say(ctx, "sí")
+    assert not (await accepting(ctx, at(10, 0, 30))).accepting
+    async with sf() as session:
+        hours = await repository.todays_hours(session, ctx["settings"], at(9, 18))
+    assert effective_hours(hours, ctx["settings"]) == "09:00 a 18:00"
+
+
+async def test_order_is_decided_at_confirmation_not_at_request(
+    ctx: dict[str, Any], clock: Clock
+) -> None:
+    """ADMIN asks for an opening, OTHER_ADMIN confirms a closure meanwhile, then ADMIN says "sí":
+    the opening was confirmed last, so it wins, and the applied summary says what it replaces."""
+    sf = ctx["session_factory"]
+    first = await say(ctx, UNTIL_ONE)
+    assert "Reemplaza" not in (await bodies(sf, first.outbound_ids))[0]
+    clock.now = at(9, 12, 1)
+    await say(ctx, RAIN, OTHER_ADMIN)
+    await say(ctx, "sí", OTHER_ADMIN)
+    clock.now = at(9, 12, 2)
+    applied = await say(ctx, "sí")
+    [body] = await bodies(sf, applied.outbound_ids)
+    assert "Reemplaza, en el horario que se superpone: cierre de hoy por lluvia." in body
+    assert (await accepting(ctx, at(10, 0, 30))).accepting
+    assert not (await accepting(ctx, at(9, 20))).accepting
+
+
+async def test_opening_after_until_further_notice(ctx: dict[str, Any], clock: Clock) -> None:
+    """A later opening overrides a closure until further notice only inside its window; the
+    still-closed reminder waits while that opening is in effect."""
+    clock.now = at(8, 21)
+    await say(ctx, UNTIL_NOTICE)
+    await say(ctx, "sí")
+    clock.now = at(9, 8)
+    INTENTS["abrimos de 9 a 11"] = ScheduleOverrideIntent(
+        kind=K.OPEN_WINDOW, start_time=dt.time(9), end_time=dt.time(11)
+    )
+    try:
+        assert (await say(ctx, "abrimos de 9 a 11")).outcome == "confirmation_requested"
+        await say(ctx, "sí")
+    finally:
+        del INTENTS["abrimos de 9 a 11"]
+    assert (await accepting(ctx, at(9, 10))).accepting
+    assert (await accepting(ctx, at(9, 11))).closure.kind == K.CLOSED_UNTIL_FURTHER_NOTICE
+    clock.now = at(9, 9)
+    assert await schedules.remind_still_closed(ctx) == 0  # open right now
+    clock.now = at(9, 11)
+    assert await schedules.remind_still_closed(ctx) == 2  # closed again
+
+
+async def test_later_closure_inside_an_opening_wins(ctx: dict[str, Any], clock: Clock) -> None:
+    """Opening first, closure confirmed later: the closure wins in the overlap."""
     INTENTS["de 23:30 a 00:30 no"] = ScheduleOverrideIntent(
         kind=K.CLOSED_WINDOW, start_time=dt.time(23, 30), end_time=dt.time(0, 30)
     )

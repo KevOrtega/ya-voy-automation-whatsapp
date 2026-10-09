@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 from ya_voy.config import Settings
@@ -19,12 +19,12 @@ from ya_voy.schedule.hours import (
     Interval,
     OverrideView,
     at_local,
-    base_interval,
     closures_in_effect,
     closures_touching,
     day_bounds,
     effective_intervals,
     intersect_all,
+    overridden_in_overlap,
     subtract,
 )
 
@@ -76,14 +76,16 @@ class Proposal:
     reason: str | None
     to_lift: list[OverrideView] = field(default_factory=list)  # reopen: closures in effect
     upcoming: list[OverrideView] = field(default_factory=list)  # later closures of today
+    replaced: list[OverrideView] = field(default_factory=list)  # overridden in the overlap
 
     def as_view(self, starts_at: dt.datetime | None = None) -> OverrideView:
+        """``starts_at`` fills in the start of a closure that starts at confirmation."""
         return OverrideView(
             id=None,
             kind=self.kind,
             status=ScheduleOverrideStatus.ACTIVE,
             business_date=self.business_date,
-            starts_at=starts_at or self.starts_at,
+            starts_at=self.starts_at or starts_at,
             ends_at=self.ends_at,
             reason=self.reason,
         )
@@ -107,6 +109,21 @@ def _clean_reason(reason: str | None) -> str | None:
 
 
 def validate_schedule_intent(
+    intent: ScheduleOverrideIntent,
+    *,
+    settings: Settings,
+    now: dt.datetime,
+    overrides: Sequence[OverrideView],
+) -> Proposal:
+    proposal = _validate(intent, settings=settings, now=now, overrides=overrides)
+    if proposal.kind == K.REOPEN:
+        return proposal
+    # As if confirmed now: closures without a period start at the confirmation.
+    replaced = overridden_in_overlap(overrides, proposal.as_view(starts_at=now), now)
+    return replace(proposal, replaced=replaced)
+
+
+def _validate(
     intent: ScheduleOverrideIntent,
     *,
     settings: Settings,
@@ -162,6 +179,9 @@ def validate_schedule_intent(
     latest = at_local(settings, day, settings.schedule_latest_close_time)
     if window.start < earliest or window.end > latest:
         raise ScheduleIntentInvalidError(InvalidCode.OPEN_OUT_OF_BOUNDS)
-    if not subtract([window], [base_interval(settings, day)]):
+    # It must open something that is not already open from now on (base hours, an earlier
+    # opening): a later opening over a closure is valid (most recent wins).
+    ahead = intersect_all([window], Interval(now, window.end))
+    if not subtract(ahead, effective_intervals(settings, overrides, day)):
         raise ScheduleIntentInvalidError(InvalidCode.OPEN_INSIDE_BASE)
     return Proposal(intent.kind, day, window.start, window.end, reason)

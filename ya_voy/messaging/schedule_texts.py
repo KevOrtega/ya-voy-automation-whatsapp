@@ -70,6 +70,24 @@ def closure_item(o: OverrideView, settings: Settings) -> str:
     return template.format(reason_text=reason_text(o.reason), **window)
 
 
+def override_item(o: OverrideView, settings: Settings) -> str:
+    if o.kind == K.OPEN_WINDOW:
+        assert o.business_date is not None
+        return catalog.OPENING_ITEM.format(
+            date=fmt_date(o.business_date),
+            reason_text=reason_text(o.reason),
+            **_window(o, settings),
+        )
+    return closure_item(o, settings)
+
+
+def replaced_note(replaced: Sequence[OverrideView], settings: Settings) -> str:
+    if not replaced:
+        return ""
+    items = ", ".join(override_item(o, settings) for o in replaced)
+    return catalog.REPLACED_NOTE.format(items=items)
+
+
 def closures_list(closures: Sequence[OverrideView], settings: Settings) -> str:
     return ", ".join(closure_item(o, settings) for o in closures)
 
@@ -119,7 +137,9 @@ def override_summary(
     report_note_text: str = "",
     to_lift: Sequence[OverrideView] = (),
     upcoming: Sequence[OverrideView] = (),
+    replaced: Sequence[OverrideView] = (),
 ) -> str:
+    """``{override_summary}``; ``replaced`` adds :data:`catalog.REPLACED_NOTE` at the end."""
     template = catalog.OVERRIDE_SUMMARIES[o.kind]
     if o.kind == K.CLOSED_TODAY:
         assert o.business_date is not None
@@ -147,7 +167,7 @@ def override_summary(
             closures_list=closures_list(to_lift, settings),
             future_closures_note=future_closures_note(upcoming, settings),
         )
-    return text.strip()
+    return " ".join(part for part in (text.strip(), replaced_note(replaced, settings)) if part)
 
 
 def invalid_reason(code: str, settings: Settings) -> str:
