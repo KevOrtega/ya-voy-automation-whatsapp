@@ -590,7 +590,9 @@ CREATE INDEX schedule_overrides_active ON schedule_overrides (starts_at, ends_at
 ```
 
 Para `closed_today` y `closed_until_further_notice`, `starts_at` se fija al confirmar (no al pedir), para
-que el cierre empiece cuando el administrador lo aprueba.
+que el cierre empiece cuando el administrador lo aprueba. En `closed_today`, al confirmar también se recalculan
+`business_date` y `ends_at` con el día operativo de la confirmación (si se pidió a las 04:58 y se confirma a las
+05:02, cierra el día nuevo).
 
 Notas sobre las restricciones:
 

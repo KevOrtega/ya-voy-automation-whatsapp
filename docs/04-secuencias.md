@@ -372,15 +372,20 @@ sequenceDiagram
     AD->>EVO: "hoy no tomamos pedidos por lluvia"
     EVO->>W: mensaje privado de un número de ADMIN_PHONES
     W->>W: ¿es comando (cancelar, liberar, estado, horario, ayuda) o respuesta sí/no? No
-    W->>LLM: parse_schedule(text, now en TZ, horario base) -> ScheduleOverrideIntent
+    Note over W: SET lock:admin:{teléfono} NX PX TTL (TTL > peor caso del LLM)
+    W->>DB: transacción corta: solicitud pendiente del administrador (revisión), COMMIT
+    Note over W,LLM: sin conexión a la base durante la llamada
+    W->>LLM: parse_schedule(text, now en TZ, día operativo, horario base) -> ScheduleOverrideIntent
     LLM-->>W: kind = closed_today, reason = "lluvia"
-    W->>W: validate_schedule_intent() y calcular starts_at = now, ends_at = 24:00 local
     rect rgb(235, 245, 255)
-        Note over W,DB: Una transacción
+        Note over W,DB: Una transacción corta
+        W->>DB: SELECT solicitud pendiente FOR UPDATE: ¿misma revisión? (si no, reintentar)
+        W->>W: validate_schedule_intent() con los cambios activos; ends_at = fin del día operativo (05:00)
         W->>DB: UPDATE schedule_overrides SET status = 'superseded' WHERE created_by = AD AND status = 'pending_confirmation'
         W->>DB: INSERT schedule_overrides (status = 'pending_confirmation', confirmation_expires_at = now + 5 min)
         W->>DB: INSERT outbound_messages (admin_schedule_confirm)
     end
+    Note over W: release lock (solo con el token propio)
     W->>EVO: sendText al administrador
     EVO->>AD: "Entendí esto: hoy 09/10 no se toman pedidos (motivo: lluvia). ¿Lo aplico? Respondé sí o no"
 

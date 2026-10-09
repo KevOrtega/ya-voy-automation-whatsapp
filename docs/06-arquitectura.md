@@ -202,6 +202,69 @@ Pendiente para la etapa 4b (`TODO(stage-4b)`): clasificar al remitente y dar de 
 evento entrante, marcándolo procesado con `finalize` en la transacción del paso 4), los efectos de los comandos (T06-T08),
 `store_help` con su espera, `store_unsupported_media` y el control de horario `is_accepting_orders` (RN-18).
 
+#### Horario y cambios de horario (etapa 7a)
+
+**Horario efectivo** (`ya_voy/schedule/hours.py`, código puro; `repository.py` lee `schedule_overrides`):
+
+- El día operativo `D` va de `BUSINESS_DAY_ROLLOVER_TIME` (05:00) de `D` a las 05:00 de `D+1`. Una hora anterior a
+  las 05:00 es del día calendario siguiente (`00:00` = 24:00, `01:00` = 25:00). Los instantes se arman con la
+  hora local en `TZ` y se comparan en UTC, así que un día con cambio de horario de verano dura 23 o 25 horas
+  sin errores (Buenos Aires no tiene, pero `TZ` es configurable).
+- Horario efectivo de `D` = (horario base + aperturas `open_window` activas de `D`) − cierres activos que tocan
+  `D`. **Precedencia: donde un cierre y una apertura se superponen, gana el cierre** (RF-08, RN-25), tanto en el
+  horario efectivo como en `is_accepting_orders`. `closed_today` corre hasta el fin del día operativo, así que
+  también cierra las aperturas de ese día (RN-26).
+- `is_accepting_orders(at)` (RN-18, para la etapa 4b): (1) si hay un cierre en vigor → cerrado con ese cierre; si
+  hay varios, el de mayor alcance (`closed_until_further_notice` > `closed_today` > `closed_window`, CU-10 3a);
+  (2) si `at` está dentro del horario base de su día operativo o de una apertura en vigor → abierto; (3) si no →
+  fuera de horario. Solo cuentan las filas `active` sin `cancelled_at`.
+- `report_due_at(D)`: el más tardío entre el fin del horario base y el fin de las aperturas activas de `D`; los
+  cierres no lo adelantan.
+
+**Validación** (`ya_voy/schedule/intents.py`, `validate_schedule_intent`), con los cambios activos leídos en la
+misma transacción que guarda la solicitud: las reglas de [05](05-modelo-datos.md). Además, `closed_today` sin
+horario efectivo restante en el día (por ejemplo, a las 23:30 sin aperturas) es inválido porque no cambia nada, y
+un `closed_window` dentro de un cierre ya activo queda vacío al recortarlo y también es inválido.
+
+**Flujo de confirmación** (`ya_voy/worker/schedule_admin.py`), con el mismo patrón que la toma de pedidos:
+
+1. Lock de Redis del administrador (`lock:admin:{teléfono}`, con el mismo TTL calculado que el de los locales).
+2. Transacción corta: lee la solicitud pendiente del administrador (su `id` es la revisión) y hace commit.
+3. Llamada al LLM (`ScheduleIntentParser`) sin conexión a la base.
+4. Transacción corta: bloquea la solicitud pendiente y verifica que sea la misma; valida con los datos actuales;
+   si es válida marca la anterior `superseded`, inserta la nueva en `pending_confirmation` con
+   `confirmation_expires_at = now() + SCHEDULE_CONFIRMATION_TTL_MINUTES` y encola `admin_schedule_confirm`
+   (`schedule_override:{id}:confirm`). Si la solicitud cambió (solo posible si se perdió el lock) o el índice
+   `schedule_overrides_one_pending_per_admin` rechaza la inserción, la transacción se deshace y se reintenta desde
+   el paso 2, hasta 3 veces. Si no es válida, responde `admin_schedule_invalid`, `admin_help` o
+   `admin_schedule_nothing_to_reopen`, y la solicitud anterior sigue pendiente (en CU-14 el reemplazo es el paso 3,
+   después de validar).
+
+"sí" y "no" no pasan por el LLM: bloquean la solicitud pendiente (`SELECT ... FOR UPDATE`) y la pasan a `active`
+(`applied` si es `reopen`) o a `rejected`, solo si sigue `pending_confirmation` y, para "sí", antes del plazo. Si
+venció, la marcan `expired` y responden `admin_schedule_confirmation_expired`. La tarea
+`expire_schedule_confirmations` hace el mismo `UPDATE` condicional sin mensaje (CU-14 6d): entre confirmación y
+vencimiento gana el que toma la fila primero, y el otro la vuelve a leer después del commit y no hace nada. Al
+confirmar:
+
+- `closed_today` y `closed_until_further_notice` toman `starts_at = now()`. `closed_today` se ancla al día operativo
+  de la **confirmación** (`ends_at` = las 05:00 siguientes), no al de la solicitud: si se confirma después de las
+  05:00, cierra el día nuevo.
+- `reopen` levanta (`cancelled`, `cancelled_at`, `cancelled_by_override_id`) los cierres en vigor en ese momento;
+  los futuros y las aperturas siguen y se informan.
+- `open_window` reabre el reporte del día en la misma transacción con el `UPDATE` de [03](03-estados-pedido.md)
+  (`sent`, `generating` o `correction_pending` → `correction_pending`, `due_at` = nuevo cierre efectivo).
+- Responde `admin_schedule_applied` (`schedule_override:{id}:applied`) con el estado resultante.
+
+`remind_still_closed` envía `admin_schedule_still_closed` una vez por día operativo y por cierre (clave
+`admin_schedule_still_closed:{fecha}:{id}`), desde `BUSINESS_HOURS_START`, si hay un `closed_until_further_notice`
+en vigor que empezó antes de ese inicio.
+
+Pendiente para la etapa 7b (`TODO(stage-7b)`): reconocer al administrador por número o `@lid` y conectar su
+texto privado con `schedules.handle_admin_text` (con `finalize`); `estado`/`horario` (CU-15,
+`admin_schedule_status`); `cancelar` y `liberar` (CU-13, dependen de la etapa de cancelaciones); confirmar
+citando el mensaje (`confirmation_wa_message_id`).
+
 #### Política de reintentos de la bandeja de salida
 
 `send_outbound` distingue errores transitorios y permanentes de Evolution:

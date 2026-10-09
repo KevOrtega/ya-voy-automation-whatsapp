@@ -212,6 +212,25 @@ Para el administrador, cualquier otro texto mientras hay una solicitud pendiente
 nueva (la anterior queda `superseded`). Para el local, cualquier otro texto mientras espera confirmación se toma
 como corrección del pedido (T05).
 
+### Propuestas de la etapa 7a (pendientes de aprobación)
+
+Textos que el código necesita y que este catálogo todavía no define. Se usan así hasta que el cliente los
+apruebe o los cambie:
+
+| Uso | Texto propuesto |
+|-----|-----------------|
+| `{reason}` de `admin_schedule_invalid`: falta la hora de inicio o la de fin | me faltan la hora de inicio y la de fin |
+| `{reason}`: fecha pasada | esa fecha ya pasó |
+| `{reason}`: la ventana ya terminó | ese horario ya terminó |
+| `{reason}`: el cierre no quita horario efectivo (fuera de horario o dentro de otro cierre) | en ese horario ya no se toman pedidos |
+| `{reason}`: apertura fuera de límites | el ejemplo de arriba, con los valores configurados de `SCHEDULE_EARLIEST_OPEN_TIME` y `SCHEDULE_LATEST_CLOSE_TIME` |
+| Elementos de `{closures_list}` (separados por ", ") | `closed_today`: "cierre de hoy{reason_text}"; `closed_until_further_notice`: "cierre hasta nuevo aviso{reason_text}"; `closed_window`: "cierre de {window_start} a {window_end}{reason_text}" |
+| `{effective_hours}` con varios tramos | "09:00 a 15:00 y 18:00 a 23:00" (", " entre tramos y " y " antes del último) |
+| `{effective_hours}` sin horario | cerrado todo el día |
+| `{accepting_label}` fuera de horario | cerrado (fuera de horario) |
+| `{accepting_label}` con un cierre sin motivo | cerrado |
+| `{date}` en los resúmenes y `{since}` | `dd/mm/aaaa`, como en el ejemplo de `open_window` |
+
 ## Reglas de envío
 
 - Los mensajes al grupo derivados de una publicación (`group_order_assigned`, `group_order_unassigned`,
