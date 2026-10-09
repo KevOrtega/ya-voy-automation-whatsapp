@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: help env venv up down logs ps test lint format migrate revision shell-web psql redis-cli clean
+.PHONY: help env venv up down logs ps test test-docker lint format migrate revision shell-web psql redis-cli clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -34,6 +34,10 @@ ps: ## Show service status
 
 test: ## Run the test suite locally
 	$(PY) -m pytest
+
+test-docker: ## Run the full suite in Docker, including integration tests against compose Postgres/Redis
+	$(COMPOSE) up -d --wait postgres redis
+	$(COMPOSE) run --rm --no-deps -e RUN_INTEGRATION=1 web pytest
 
 lint: ## Run ruff (lint + format check)
 	$(VENV)/bin/ruff check .
