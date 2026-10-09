@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 # Attributes every LogRecord has; anything else passed via `extra=` is emitted as a field.
-_RESERVED = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+_RESERVED = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "color_message"}
 
 
 class JsonFormatter(logging.Formatter):
@@ -27,9 +27,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
+# Loggers that uvicorn and arq configure with their own plain-text handlers.
+_THIRD_PARTY_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
+
+
 def configure_logging(level: str = "INFO") -> None:
+    """Route everything through a single JSON handler on the root logger."""
     handler = logging.StreamHandler()
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level.upper())
+    for name in _THIRD_PARTY_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.propagate = True
