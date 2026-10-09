@@ -72,7 +72,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `alert_unclaimed_orders` | `published`, sin alerta, `unclaimed_alert_at < now()` | T15 |
 | `expire_schedule_confirmations` | `schedule_overrides` en `pending_confirmation` con `confirmation_expires_at < now()` | Pasan a `expired` |
 | `remind_still_closed` | Hora local ≥ `BUSINESS_HOURS_START`, hay un `closed_until_further_notice` activo y no se avisó hoy | `admin_schedule_still_closed` |
-| `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`failed` | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
+| `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`generating` (las revisiones fallidas se reintentan hasta `DAILY_REPORT_MAX_ATTEMPTS`; un reporte `failed` es terminal) | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
 | `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` con más de `OUTBOUND_RECOVERY_SECONDS` | Reencolar |
@@ -280,6 +280,56 @@ Pendiente para la etapa 7b (`TODO(stage-7b)`): reconocer al administrador por n�
 texto privado con `schedules.handle_admin_text` (con `finalize`); `estado`/`horario` (CU-15,
 `admin_schedule_status`); `cancelar` y `liberar` (CU-13, dependen de la etapa de cancelaciones); confirmar
 citando el mensaje (`confirmation_wa_message_id`).
+
+#### Reporte diario y correcciones (etapa 8a)
+
+Paquete `ya_voy/reports`: `model` (filas, foto y diferencia neta), `xlsx` (archivo con openpyxl), `repository`
+(consultas) y `service` (paso de cada día). Los crons `process_daily_reports` y `process_report_corrections`
+(`worker/reports.py`) llaman a `service.run_step` por día y devuelven `{fecha: resultado}`; un error en un día
+no frena a los demás.
+
+Cada paso tiene tres partes, y el armado del archivo nunca ocurre dentro de una transacción:
+
+1. **Transacción corta.** Si `now() < report_due_at(D)` no hace nada (la fila recién se crea al vencer, con
+   `ON CONFLICT DO NOTHING`; mientras espera se recalcula `due_at`, así una apertura confirmada después
+   corre la hora). Toma el reporte con `FOR UPDATE SKIP LOCKED` (otro cron lo tiene → `busy`). Si hay
+   pendientes (`draft`, `awaiting_confirmation`, `published`), queda en `waiting` y, a los
+   `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo, manda una sola vez `admin_report_pending_reminder`
+   (clave `admin_report_pending_reminder:{D}:{due_at}:{teléfono}`; solo antes del primer envío o si lo reabrió
+   una apertura; no se manda si solo hay borradores sin código). Toma los pedidos del día con
+   `FOR SHARE NOWAIT` dentro de un savepoint (si una transición los tiene → `busy`, se reintenta en la próxima
+   corrida), arma la foto y la diferencia contra la última revisión enviada y deja la revisión en
+   `generating` (`attempts + 1`, `last_checked_at` = inicio del intento).
+2. **Sin transacción.** Arma el `.xlsx` en `asyncio.to_thread`.
+3. **Transacción corta.** Bloquea reporte y revisión (en ese orden), verifica que el intento siga siendo el
+   mismo, guarda el archivo y encola un documento por administrador (`daily_report:{D}:v{N}:{teléfono}`).
+
+Orden de locks: pedido → reporte (transiciones de pedidos) y reporte → revisión (crons y bandeja de salida).
+El cron nunca espera un lock de pedido (`NOWAIT`), así que no puede formar un ciclo con una transición.
+
+Reglas:
+
+- Una revisión en `generating` cuenta como en curso durante 10 minutos desde `last_checked_at`; después se
+  reintenta con el mismo número. Los fallos de armado se reintentan hasta `DAILY_REPORT_MAX_ATTEMPTS`; al
+  agotarse, la revisión y el reporte quedan `failed` (terminal) y sale `admin_daily_report_failed` (clave
+  `admin_daily_report_failed:{D}:v{N}`) con un texto genérico; el error técnico queda en `last_error`.
+- El reporte pasa a `sent` cuando se enviaron todas las copias. Si una copia falla definitivamente, la
+  revisión y el reporte quedan `failed` y la alerta es `admin_daily_report_failed` (en lugar de
+  `admin_outbound_failed`).
+- Corrección sin diferencia neta (p. ej. se liberó y lo volvió a tomar el mismo motero): no se genera
+  versión; el reporte vuelve a `sent`. Si había una versión sin enviar que se reintentaba, queda `failed`
+  ("superseded: no net changes").
+- Recuperación: `process_daily_reports` mira desde el día siguiente al último reporte (en una base nueva,
+  desde el primer día con pedidos) hasta hoy, como máximo 7 días hacia atrás, más los reportes en `waiting`
+  o `generating`.
+- Sin `ADMIN_PHONES` no se genera nada (advertencia en el log).
+- La nota de cambios de horario va solo en la versión 1.
+- El archivo muestra nombres de moteros y horas de Buenos Aires (`dd/mm/aaaa hh:mm`).
+
+Pendiente para la etapa 8b (`TODO(stage-8b)`): reconocer al administrador por número o `@lid` para comandos
+sobre el reporte (`estado` con el estado del reporte, reintento manual de un reporte `failed`); conectar
+T13, T16, T17 y T18 (etapas de liberación y cancelación) con `mark_report_for_correction`; probar el envío
+real del documento con Evolution.
 
 #### Política de reintentos de la bandeja de salida
 

@@ -469,7 +469,7 @@ correcciones (RN-22, RN-23).
 | `due_at` | `timestamptz` | `NOT NULL` | Cierre efectivo del día (`report_due_at(D)`); se recalcula mientras está `waiting` y cuando una apertura extra reabre el reporte. Ninguna versión se envía antes de `due_at`. |
 | `current_revision` | `int` | `NOT NULL DEFAULT 0` | Última versión enviada (0 = ninguna). |
 | `pending_orders_count` | `int` | `NOT NULL DEFAULT 0` | Última cuenta de pendientes. |
-| `last_checked_at` | `timestamptz` | nullable | Última verificación de pendientes. |
+| `last_checked_at` | `timestamptz` | nullable | Última verificación de pendientes; mientras el reporte está en `generating`, inicio del intento en curso (se considera colgado a los 10 minutos). |
 | `pending_reminder_sent_at` | `timestamptz` | nullable | Recordatorio de `REPORT_PENDING_REMINDER_MINUTES` enviado (una vez por cierre efectivo: antes del primer envío y en cada reapertura por apertura extra, que lo vuelve a `NULL`). |
 | `correction_requested_at` | `timestamptz` | nullable | Primer cambio posterior al último envío. |
 | `reopened_by_override_id` | `bigint` | FK → `schedule_overrides.id`, nullable | Apertura extra que reabrió el reporte (RF-55). Mientras no es nulo, aplica el recordatorio de pendientes. Se limpia al enviar la corrección o al volver a `sent` sin cambios. |

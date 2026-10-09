@@ -140,10 +140,17 @@ En la misma transacción que T13, T16, T17 y T18 se ejecuta:
 
 ```sql
 UPDATE daily_reports
-   SET status = 'correction_pending', updated_at = now()
+   SET status = 'correction_pending',
+       correction_requested_at = COALESCE(correction_requested_at, now()),
+       updated_at = now()
  WHERE report_date = :order_business_date
-   AND status = 'sent';
+   AND status IN ('sent', 'generating');
 ```
+
+(Etapa 8a: `reports.service.mark_report_for_correction`; se llama **después** de actualizar el pedido, para
+respetar el orden de locks pedido → reporte.) Incluye `generating`: un cambio confirmado después de la foto de
+una versión en curso también debe corregirse; esa versión se termina de enviar igual y la corrección sale
+después.
 
 Así la corrección (CU-17) no depende de que la tarea periódica detecte el cambio por otra vía. Como `due_at` ya
 pasó, la corrección sale en cuanto no quedan pendientes del día.

@@ -234,6 +234,26 @@ apruebe o los cambie:
 | Elemento de `{items}` para una apertura (los cierres usan los elementos de `{closures_list}`) | apertura del {date} de {window_start} a {window_end}{reason_text} |
 | Ejemplo completo (apertura después de un cierre por lluvia) | El 09/10/2026 se toman pedidos también de 19:00 a 23:00. Horario de ese día: 09:00 a 10:00 y 19:00 a 23:00. Reemplaza, en el horario que se superpone: cierre de hoy por lluvia. |
 
+### Propuestas de la etapa 8a (pendientes de aprobación)
+
+Textos del reporte diario que el código necesita y que este catálogo todavía no define. Se usan así hasta que
+el cliente los apruebe o los cambie:
+
+| Uso | Texto propuesto |
+|-----|-----------------|
+| Columna "Cambio" de `Pedidos` y "Detalle" breve, por tipo | `added`: "Agregado"; `courier_changed`: "Cambió de motero"; `cancelled`: "Cancelado" |
+| Columna "Antes" de `Correcciones` para un pedido agregado | No estaba |
+| Columnas "Antes"/"Ahora" de `Correcciones` cuando el pedido está asignado | Tomado por {courier} |
+| Columna "Detalle" de `Correcciones` | La línea de "Textos de cambios" sin la viñeta ni los asteriscos (p. ej. "El pedido YV-0123 pasó de Joel a Emiliano.") |
+| `{error}` de `admin_daily_report_failed` cuando falla el armado del archivo (el error técnico no se muestra; queda en `last_error`) | no pude armar el archivo |
+| `{error}` de `admin_daily_report_failed` cuando falla el envío del documento | no se pudo enviar el archivo a {recipient_name} tras {attempts_text} |
+| `{code}` de `admin_report_pending_reminder` ("Para cancelar uno: *cancelar {code}*") | El primer código de `{pending_codes}` |
+| Elementos de `{schedule_note}` (separados por ", ", ordenados por hora de inicio) | Los mismos de la etapa 7a: "cierre de hoy{reason_text}", "cierre de {window_start} a {window_end}{reason_text}", "apertura del {date} de {window_start} a {window_end}{reason_text}" |
+| Fechas y horas del archivo | Hora de Buenos Aires, formato `dd/mm/aaaa hh:mm` |
+
+Observación para el cliente: `admin_daily_report_correction` dice "La corrección del reporte … está listo";
+se mantiene literal, pero quizás corresponda "está lista".
+
 ## Reglas de envío
 
 - Los mensajes al grupo derivados de una publicación (`group_order_assigned`, `group_order_unassigned`,
