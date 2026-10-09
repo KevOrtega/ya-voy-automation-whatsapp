@@ -403,6 +403,16 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 
 Índices: `(chat_jid, created_at)`, `(order_id)`, `(wa_message_id)`.
 
+Restricciones adicionales (el evento de origen solo existe para los mensajes entrantes y la fila de la
+bandeja de salida solo para los salientes; ninguno de los dos es obligatorio):
+
+```sql
+ALTER TABLE messages ADD CONSTRAINT messages_inbound_event_only_in
+    CHECK (direction = 'in' OR inbound_event_id IS NULL);
+ALTER TABLE messages ADD CONSTRAINT messages_outbound_message_only_out
+    CHECK (direction = 'out' OR outbound_message_id IS NULL);
+```
+
 ### `outbound_messages` (bandeja de salida)
 
 | Columna | Tipo | Restricciones | Notas |
@@ -426,6 +436,16 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 
 Índices: `(status, created_at) WHERE status IN ('pending','failed')`, `(wa_message_id)`,
 `(recipient_jid, id) WHERE status IN ('pending','sending')` (orden FIFO por destinatario).
+
+Restricciones adicionales (`delete` y `edit` actúan sobre un mensaje propio existente; un documento es
+siempre el archivo de una revisión del reporte):
+
+```sql
+ALTER TABLE outbound_messages ADD CONSTRAINT outbound_messages_target_for_delete_edit
+    CHECK (message_type NOT IN ('delete', 'edit') OR target_wa_message_id IS NOT NULL);
+ALTER TABLE outbound_messages ADD CONSTRAINT outbound_messages_revision_for_document
+    CHECK (message_type <> 'document' OR report_revision_id IS NOT NULL);
+```
 
 Las respuestas del bot en el grupo sobre un pedido (publicación, "Asignado a…", "vuelve a estar
 disponible") se encuentran con `order_id` + `recipient_jid = COURIERS_GROUP_JID` + `message_type = 'text'`;
@@ -534,14 +554,29 @@ Restricciones e índices:
 CREATE UNIQUE INDEX schedule_overrides_one_pending_per_admin
     ON schedule_overrides (created_by) WHERE status = 'pending_confirmation';
 
--- Applied overrides must have a start; windows must have a valid end
+-- Applied overrides must have a start; windows must have a valid start and end
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_period CHECK (
     kind = 'reopen'
     OR status IN ('pending_confirmation', 'rejected', 'expired', 'superseded')
     OR starts_at IS NOT NULL
 );
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_window CHECK (
-    kind NOT IN ('closed_window', 'open_window') OR (ends_at IS NOT NULL AND starts_at < ends_at)
+    kind NOT IN ('closed_window', 'open_window')
+    OR (starts_at IS NOT NULL AND ends_at IS NOT NULL AND starts_at < ends_at)
+);
+
+-- 'applied' only for reopen; 'cancelled' only for closures; reopen is never 'active'
+ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_status_by_kind CHECK (
+    CASE kind
+        WHEN 'reopen' THEN status NOT IN ('active', 'cancelled')
+        WHEN 'open_window' THEN status NOT IN ('applied', 'cancelled')
+        ELSE status <> 'applied'
+    END
+);
+
+-- Affected business day only for closed_today, closed_window and open_window
+ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_business_date_by_kind CHECK (
+    (business_date IS NOT NULL) = (kind IN ('closed_today', 'closed_window', 'open_window'))
 );
 
 -- Effective-hours lookup
@@ -551,6 +586,20 @@ CREATE INDEX schedule_overrides_active ON schedule_overrides (starts_at, ends_at
 
 Para `closed_today` y `closed_until_further_notice`, `starts_at` se fija al confirmar (no al pedir), para
 que el cierre empiece cuando el administrador lo aprueba.
+
+Notas sobre las restricciones:
+
+- `schedule_overrides_window` exige también `starts_at` en las ventanas: sin él, `starts_at < ends_at` da
+  `NULL` y el `CHECK` lo dejaría pasar. Las ventanas tienen inicio desde que se crean (día + hora de inicio).
+- `schedule_overrides_status_by_kind` sale de la máquina de estados de [03](03-estados-pedido.md): `reopen`
+  pasa de `pending_confirmation` a `applied` (nunca a `active` ni `cancelled`); `open_window` pasa a `active` y
+  no se levanta con `reopen` (nunca `cancelled`); los cierres pasan a `active` y pueden quedar `cancelled`.
+- `schedule_overrides_business_date_by_kind`: el día operativo afectado se conoce al interpretar la
+  instrucción (también en `closed_today`), así que se exige desde `pending_confirmation`.
+- Quedan en el código (no son `CHECK`): qué `kind` lleva `ends_at` (`closed_today` sí, `closed_until_further_notice`
+  no), si `reopen` lleva `starts_at`/`ends_at`, y la coherencia de `confirmed_at`, `cancelled_at` y
+  `cancelled_by_override_id` con el estado. Los documentos no fijan en qué momento se completan todos esos
+  campos, y un `CHECK` adivinado podría bloquear el flujo de confirmación.
 
 ## Esquema de extracción (`OrderExtraction`)
 
