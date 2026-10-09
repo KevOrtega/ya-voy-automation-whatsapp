@@ -6,25 +6,30 @@ plantillas) están en inglés, igual que el código.
 
 | # | Documento | Contenido |
 |---|-----------|-----------|
-| 01 | [Requisitos](01-requisitos.md) | Actores, requisitos funcionales (RF), no funcionales (RNF), reglas de negocio (RN), supuestos y preguntas abiertas para el cliente |
-| 02 | [Casos de uso](02-casos-de-uso.md) | Diagrama general y casos de uso con flujos principales y alternativos |
+| 01 | [Requisitos](01-requisitos.md) | Actores, requisitos funcionales (RF), no funcionales (RNF), reglas de negocio (RN), datos del pedido, decisiones del cliente (DC) y preguntas abiertas (PA) |
+| 02 | [Casos de uso](02-casos-de-uso.md) | Diagrama general y casos de uso con flujos principales y alternativos, incluido el reporte diario |
 | 03 | [Estados del pedido](03-estados-pedido.md) | Máquina de estados del pedido y tabla de transiciones |
-| 04 | [Secuencias](04-secuencias.md) | Diagramas de secuencia: recepción y validación; toma, carrera y liberación |
-| 05 | [Modelo de datos](05-modelo-datos.md) | DER, tablas, restricciones e índices |
-| 06 | [Arquitectura](06-arquitectura.md) | C4 niveles 1 y 2, componentes, entorno de desarrollo, mapeo a Dokku, variables de entorno |
+| 04 | [Secuencias](04-secuencias.md) | Recepción y validación; toma, carrera y liberación; alerta de pedido sin tomar; reporte diario |
+| 05 | [Modelo de datos](05-modelo-datos.md) | DER, tablas, restricciones, índices, alta automática de locales y moteros, esquema de extracción |
+| 06 | [Arquitectura](06-arquitectura.md) | C4 niveles 1 y 2, tareas programadas, entorno de desarrollo, mapeo a Dokku, riesgos, variables de entorno |
 | 07 | [Catálogo de mensajes](07-catalogo-mensajes.md) | Todas las plantillas que envía el bot, cuándo y a quién |
 
 ## Glosario
 
 | Término | Significado | Identificador en código |
 |---------|-------------|-------------------------|
-| Local | Comercio que genera pedidos de envío | `store` |
-| Motero / repartidor | Persona que retira y entrega el pedido | `courier` |
+| Local | Quien escribe al bot por privado para pedir un envío (alta automática) | `store` |
+| Motero / repartidor | Participante del grupo que toma pedidos (alta automática al reaccionar) | `courier` |
+| Administrador | El cliente (jefe de los moteros); recibe alertas y el reporte | `admin` |
 | Grupo de moteros | Grupo de WhatsApp donde se publican los pedidos | `couriers_group` |
 | Borrador | Pedido en construcción, todavía incompleto | `order` con `status = 'draft'` |
-| Publicación | Mensaje del pedido en el grupo de moteros | `group_post` |
+| Publicación | Mensaje único del pedido en el grupo de moteros | `orders.group_message_id` |
 | Tomar un pedido | Reaccionar con cualquier emoji a la publicación | `claim` |
-| Liberar un pedido | Quitar la reacción (solo el motero asignado) | `unclaim` |
+| Liberar un pedido | Quitar la reacción (solo el motero asignado) o comando del admin | `release` |
+| Pedido sin tomar | Pedido publicado sin motero por más de `UNCLAIMED_ALERT_MINUTES`; se alerta al admin | `unclaimed_alert_sent_at` |
+| Jornada | Período del reporte diario: de `DAILY_REPORT_TIME` a `DAILY_REPORT_TIME` | `period_start`, `period_end` |
+| Horario de operación | Franja en la que se aceptan pedidos nuevos | `BUSINESS_HOURS_START`, `BUSINESS_HOURS_END` |
+| `pushName` | Nombre de perfil que el usuario se puso en WhatsApp | `display_name` |
 | LID | Identificador anónimo de WhatsApp (`xxxx@lid`) usado en grupos en lugar del número | `lid` |
 | JID | Identificador de chat de WhatsApp (`549...@s.whatsapp.net`, `...@g.us`) | `jid` |
 
@@ -32,5 +37,6 @@ plantillas) están en inglés, igual que el código.
 
 - Diagramas en [Mermaid](https://mermaid.js.org/), se ven directamente en GitHub/GitLab.
 - Referencias cruzadas: `RF-xx` (funcional), `RNF-xx` (no funcional), `RN-xx` (regla de negocio),
-  `CU-xx` (caso de uso), `PA-xx` (pregunta abierta), claves de plantilla en `snake_case`.
-- Los valores configurables se indican con su variable de entorno (por ejemplo `CLAIM_TIMEOUT_MINUTES`).
+  `CU-xx` (caso de uso), `Txx` (transición), `DC-xx` (decisión del cliente), `PA-xx` (pregunta abierta),
+  `R-xx` (riesgo), claves de plantilla en `snake_case`.
+- Los valores configurables se indican con su variable de entorno (por ejemplo `UNCLAIMED_ALERT_MINUTES`).

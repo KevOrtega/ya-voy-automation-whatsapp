@@ -2,15 +2,16 @@
 
 WhatsApp automation for a delivery dispatcher. Stores send orders to a bot number over
 WhatsApp; the bot validates them, publishes complete orders to a couriers' WhatsApp group,
-and lets couriers claim an order by reacting to its message.
+and lets couriers claim an order by reacting to its message. Stores and couriers are
+auto-registered from WhatsApp, and the admin receives alerts and a daily `.xlsx` report.
 
 > Status: **design phase**. This repository currently contains only the system analysis
 > and design documents. No application code yet.
 
 ## Stack (planned)
 
-- Python + FastAPI (webhook receiver and admin API)
-- arq worker (background processing, outbound messages, timeouts)
+- Python + FastAPI (webhook receiver)
+- arq worker (background processing, outbound messages, scheduled tasks, daily report with openpyxl)
 - PostgreSQL (source of truth: orders, drafts, conversation history, audit log)
 - Redis (job queue and locks; also required by Evolution API)
 - Evolution API (WhatsApp gateway, Baileys-based)
