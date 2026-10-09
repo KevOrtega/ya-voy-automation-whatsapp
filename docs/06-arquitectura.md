@@ -219,6 +219,7 @@ Consideraciones:
 | R-14 | Una apertura extra pasada la medianoche mezcla pedidos de dos fechas calendario. | Día operativo con corte configurable; las horas después de medianoche se muestran como del día siguiente en el resumen de confirmación. |
 | R-15 | Muchas correcciones si se liberan o cancelan pedidos de días viejos. | Solo se envía una corrección cuando hay cambio neto y no quedan pendientes de esa fecha; varias modificaciones se acumulan en una sola corrección. |
 | R-16 | El administrador extiende un día ya reportado y espera ver los pedidos nuevos en el reporte original. | El resumen de confirmación avisa que irán en una corrección y a qué hora; la corrección lista cada pedido agregado. |
+| R-17 | El secreto del webhook viaja en la ruta (`/webhooks/evolution/{secret}`) y Evolution guarda esa URL en su base y la escribe en sus logs de error al fallar una entrega; quien acceda al manager, la API o la base de Evolution puede leerlo. | Nuestros logs lo reemplazan por `***` (`RedactWebhookSecretFilter`) y en desarrollo se quitó `WEBHOOKS` del `LOG_LEVEL` de Evolution. En producción (Dokku): manager y API de Evolution solo con HTTPS, `AUTHENTICATION_API_KEY` fuerte y acceso restringido (idealmente no expuestos públicamente o detrás de autenticación/lista de IPs); el webhook usa la red interna de Dokku; base y logs de Evolution con acceso restringido; rotar `WEBHOOK_SECRET` (y reconfigurar el webhook de la instancia) si se sospecha una filtración. |
 
 ## 6. Variables de entorno
 
