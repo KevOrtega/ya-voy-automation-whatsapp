@@ -54,7 +54,7 @@ flowchart TB
 
 | Contenedor | Tecnología | Responsabilidad | No hace |
 |------------|-----------|-----------------|---------|
-| `web` | FastAPI + Uvicorn, SQLAlchemy 2 (async) + asyncpg | Validar el secreto del webhook, descartar lo obviamente irrelevante (`fromMe`, otros grupos, estados), insertar en `inbound_events`, encolar, responder rápido. `/health`. | Llamar al LLM o a Evolution. No expone API de administración. |
+| `web` | FastAPI + Uvicorn, SQLAlchemy 2 (async) + asyncpg | Validar el secreto del webhook, descartar lo obviamente irrelevante (ver reglas de descarte abajo), insertar en `inbound_events` sin los campos secretos del sobre (`destination`, `apikey`), encolar, responder rápido. `/health`. | Llamar al LLM o a Evolution. No expone API de administración. |
 | `worker` | arq, openpyxl | `process_inbound_event`, `evaluate_draft`, `send_outbound`; tareas cron: vencimiento de borradores y confirmaciones de pedido, alerta de pedidos sin tomar, vencimiento de confirmaciones de horario, recordatorio de cierre vigente, reporte diario y correcciones (con espera de pendientes), retención y barridos de recuperación. | Exponer HTTP. |
 | `postgres` | PostgreSQL 16 | Fuente de verdad. Dos bases: `yavoy` (aplicación) y `evolution` (interna de Evolution). | — |
 | `redis` | Redis 7 | Cola de arq, lock por local, lock del límite de envío, contadores de límite por remitente, caché de Evolution (con prefijo propio). | Guardar estado de negocio. |
@@ -75,7 +75,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`failed` | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
 | `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
-| `recover_outbound_messages` | `outbound_messages` en `pending` antiguos | Reencolar |
+| `recover_outbound_messages` | `outbound_messages` en `pending` con más de `OUTBOUND_RECOVERY_SECONDS` | Reencolar |
 | `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` |
 
 ### Componentes internos (paquete `ya_voy`, propuesta)
@@ -116,6 +116,42 @@ ya_voy/
   netos contra la última revisión enviada (`diff_snapshots`) y genera el `.xlsx` en memoria con openpyxl
   (encabezados en negrita, columnas de fecha con formato `dd/mm/yyyy hh:mm`, filtros automáticos; hoja
   `Correcciones` en las correcciones).
+
+#### Reglas de descarte del webhook
+
+El webhook responde `200` sin guardar nada (`{"status": "ignored", "reason": ...}`) cuando el evento:
+
+- no es `messages.upsert` ni `connection.update` (`unsupported_event`);
+- viene de otra instancia de Evolution (`other_instance`);
+- es `fromMe` (`from_me`), de `status@broadcast` u otra difusión (`status_broadcast`) o no tiene chat (`no_chat`);
+- es de un grupo distinto de `COURIERS_GROUP_JID` (`other_group`);
+- es del grupo de moteros pero no es una reacción (`group_not_reaction`): la charla del grupo no se guarda
+  (RF-02, RN-12, privacidad). Si una reacción apunta a la publicación de un pedido lo decide el worker,
+  porque necesita la base.
+
+Códigos de respuesta (Evolution reintenta todo salvo 400/401/403/404/422): `404` secreto incorrecto, `400`
+payload que no es JSON o no es un evento de Evolution (sin bucle de reintentos), `503` base no disponible
+(Evolution reintenta; la deduplicación lo hace seguro), `200` en los demás casos. Si falla el encolado
+después de guardar, igual responde `200` y el barrido `recover_inbound_events` lo recupera.
+
+#### Eventos entrantes fallidos
+
+Si `process_inbound_event` falla, el evento queda en `inbound_events.status = 'failed'` con `error` y se
+registra en el log a nivel `ERROR` con `inbound_event_id` y el error. No se reintenta solo (el barrido
+toma solo `received`). La etapa 4 agrega un comando manual para reprocesar eventos fallidos.
+
+#### Política de reintentos de la bandeja de salida
+
+`send_outbound` distingue errores transitorios y permanentes de Evolution:
+
+- **Transitorios** (error de red o timeout, `5xx`, `408`, `429`): reintento con backoff exponencial
+  (2, 4, 8, ... segundos, tope 5 minutos) hasta `OUTBOUND_MAX_ATTEMPTS`.
+- **Permanentes** (cualquier otro `4xx`, respuesta `2xx` inutilizable, archivo del reporte faltante): pasa
+  directo a `failed`, sin reintentos.
+
+Al quedar en `failed` (por cualquiera de las dos vías) se encola `admin_outbound_failed` para cada
+administrador, salvo que el mensaje fallido sea esa misma alerta. El backoff vigente se guarda en Redis
+(`outbound:backoff:{id}`) para que el barrido no lo saltee.
 
 ### Decisiones de diseño
 
@@ -220,6 +256,7 @@ Consideraciones:
 | R-15 | Muchas correcciones si se liberan o cancelan pedidos de días viejos. | Solo se envía una corrección cuando hay cambio neto y no quedan pendientes de esa fecha; varias modificaciones se acumulan en una sola corrección. |
 | R-16 | El administrador extiende un día ya reportado y espera ver los pedidos nuevos en el reporte original. | El resumen de confirmación avisa que irán en una corrección y a qué hora; la corrección lista cada pedido agregado. |
 | R-17 | El secreto del webhook viaja en la ruta (`/webhooks/evolution/{secret}`) y Evolution guarda esa URL en su base y la escribe en sus logs de error al fallar una entrega; quien acceda al manager, la API o la base de Evolution puede leerlo. | Nuestros logs lo reemplazan por `***` (`RedactWebhookSecretFilter`) y en desarrollo se quitó `WEBHOOKS` del `LOG_LEVEL` de Evolution. En producción (Dokku): manager y API de Evolution solo con HTTPS, `AUTHENTICATION_API_KEY` fuerte y acceso restringido (idealmente no expuestos públicamente o detrás de autenticación/lista de IPs); el webhook usa la red interna de Dokku; base y logs de Evolution con acceso restringido; rotar `WEBHOOK_SECRET` (y reconfigurar el webhook de la instancia) si se sospecha una filtración. |
+| R-18 | Envío duplicado: `send_outbound` mantiene el lock de la fila mientras llama a Evolution; si el worker se cae (o se corta la conexión con la base) después de que Evolution envió el mensaje y antes del `COMMIT`, la fila vuelve a `pending` y el barrido la reenvía. | Ventana muy corta (una llamada HTTP); el `COMMIT` va inmediatamente después del envío y no hay más trabajo en esa transacción. Un duplicado repite un aviso pero no cambia el estado de ningún pedido (los cambios de estado ya se confirmaron antes de encolar). Una `2xx` con respuesta inutilizable no se reintenta (puede haberse enviado). Si se vuelve un problema real: marcar `sending` en una transacción previa y, ante una fila `sending` vieja, consultar a Evolution por el mensaje antes de reenviar en vez de reenviar a ciegas. |
 
 ## 6. Variables de entorno
 
@@ -266,6 +303,7 @@ Consideraciones:
 | `HELP_REPLY_COOLDOWN_MINUTES` | `30` | |
 | `SCHEDULER_INTERVAL_SECONDS` | `30` | Frecuencia de las tareas programadas. |
 | `INBOUND_RECOVERY_SECONDS` | `60` | Antigüedad para reencolar eventos no procesados. |
+| `OUTBOUND_RECOVERY_SECONDS` | `60` | Antigüedad para reencolar mensajes salientes en `pending` (barrido de la bandeja de salida). |
 | `OUTBOUND_MIN_INTERVAL_MS` | `1000` | Separación mínima entre envíos. |
 | `OUTBOUND_MAX_ATTEMPTS` | `5` | |
 | `DATA_RETENTION_DAYS` | `90` | Anonimización de datos. |

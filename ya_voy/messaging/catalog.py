@@ -21,8 +21,7 @@ TEMPLATES: dict[str, str] = {
     ),
 }
 
-# Names for recipients that are neither a store nor a courier, used in {recipient_name}.
-# TODO(client): doc 07 does not define them; proposed wording to review with the client.
+# {recipient_name} for recipients that are neither a store nor a courier (doc 07).
 COURIERS_GROUP_NAME = "el grupo de moteros"
 ADMIN_RECIPIENT_NAME = "un administrador"
 UNKNOWN_RECIPIENT_NAME = "un destinatario sin nombre"

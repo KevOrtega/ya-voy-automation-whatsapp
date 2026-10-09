@@ -481,5 +481,8 @@ Todos los envíos siguen el mismo patrón, que no se repite en los diagramas ant
    otra anterior pendiente para el mismo `recipient_jid`), llama a Evolution según `message_type`
    (`text` → `sendText`, `document` → `sendMedia`, `delete` → `deleteMessageForEveryone`, `edit` → `updateMessage`)
    y guarda `wa_message_id` y `status = 'sent'`.
-4. Ante error, reintenta con backoff hasta `OUTBOUND_MAX_ATTEMPTS`; luego `status = 'failed'` y alerta al administrador.
-5. Una tarea de barrido reencola filas `pending` antiguas (por si se perdió el trabajo en Redis).
+4. Ante un error transitorio (red o timeout, `5xx`, `408`, `429`) reintenta con backoff hasta
+   `OUTBOUND_MAX_ATTEMPTS`; un error permanente (cualquier otro `4xx`) no se reintenta. En ambos casos termina
+   en `status = 'failed'` y alerta al administrador (`admin_outbound_failed`, salvo que la fila fallida sea
+   esa alerta). Detalle en [arquitectura](06-arquitectura.md), "Política de reintentos de la bandeja de salida".
+5. Una tarea de barrido reencola filas `pending` con más de `OUTBOUND_RECOVERY_SECONDS` (por si se perdió el trabajo en Redis).

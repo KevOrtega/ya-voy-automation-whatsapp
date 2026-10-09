@@ -135,6 +135,9 @@ Los cierres y aperturas de horario no se anuncian en el grupo (RF-46).
 | `admin_whatsapp_disconnected` | Evento `connection.update` con estado cerrado | ❗ El número del bot se desconectó de WhatsApp. Hay que volver a vincularlo desde el manager. |
 
 `{schedule_note}`: si hubo cierres o aperturas extra en el día, `"\nCambios de horario: {lista}"`; si no, vacío.
+`{recipient_name}` en `admin_outbound_failed`: `stores.display_name` o `couriers.display_name` del
+destinatario; si es el grupo de moteros, `"el grupo de moteros"`; si es un administrador, `"un administrador"`;
+si no se lo conoce, `"un destinatario sin nombre"`. Nunca un teléfono (RN-17).
 `admin_whatsapp_disconnected` no podrá llegar mientras el número esté desconectado; se registra en logs y se
 envía al reconectar.
 
