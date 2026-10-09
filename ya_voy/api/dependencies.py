@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from arq.connections import ArqRedis
 from fastapi import Request
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ya_voy.config import Settings
 
@@ -20,6 +20,10 @@ def settings_dependency(request: Request) -> Settings:
 
 def get_engine(request: Request) -> AsyncEngine:
     return request.app.state.engine
+
+
+def get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+    return request.app.state.session_factory
 
 
 def get_redis(request: Request) -> ArqRedis:

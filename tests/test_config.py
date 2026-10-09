@@ -104,3 +104,19 @@ def test_production_requires_secrets() -> None:
         make_settings(app_env="production", evolution_api_key="k")
     s = make_settings(app_env="production", evolution_api_key="k", webhook_secret="w")
     assert not s.is_development
+
+
+def test_capture_mode_defaults_off() -> None:
+    settings = make_settings()
+    assert settings.capture_inbound_payloads is False
+    assert settings.capture_dir == "data/captures"
+
+
+def test_capture_mode_is_refused_in_production() -> None:
+    with pytest.raises(ValidationError, match="CAPTURE_INBOUND_PAYLOADS"):
+        make_settings(
+            app_env="production",
+            webhook_secret="s",
+            evolution_api_key="k",
+            capture_inbound_payloads=True,
+        )

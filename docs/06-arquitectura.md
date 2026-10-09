@@ -269,6 +269,8 @@ Consideraciones:
 | `OUTBOUND_MIN_INTERVAL_MS` | `1000` | Separación mínima entre envíos. |
 | `OUTBOUND_MAX_ATTEMPTS` | `5` | |
 | `DATA_RETENTION_DAYS` | `90` | Anonimización de datos. |
+| `CAPTURE_INBOUND_PAYLOADS` | `0` | Solo desarrollo (en producción se rechaza): guarda cada payload crudo del webhook en `CAPTURE_DIR` para la verificación con número real. |
+| `CAPTURE_DIR` | `data/captures` | Carpeta de capturas (ignorada por git). |
 
 ### Evolution API (referencia; nombres de la imagen oficial, se confirman al fijar versión)
 

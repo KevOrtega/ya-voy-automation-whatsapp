@@ -14,6 +14,7 @@ import pytest
 import uvicorn
 
 from tests.conftest import make_settings
+from ya_voy.api.dependencies import get_redis, get_session_factory
 from ya_voy.api.main import create_app
 from ya_voy.logging import JsonFormatter, RedactWebhookSecretFilter, configure_logging, redact
 
@@ -115,6 +116,9 @@ async def test_real_uvicorn_access_log_never_contains_secret(
 ) -> None:
     """End to end: real uvicorn server, real access logger, configured JSON handler."""
     app = create_app(make_settings(webhook_secret=SECRET, log_level="INFO"))
+    # lifespan is off: no DB/Redis. An unsupported event is acknowledged without touching them.
+    app.dependency_overrides[get_session_factory] = lambda: None
+    app.dependency_overrides[get_redis] = lambda: None
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, lifespan="off")
     server = uvicorn.Server(config)

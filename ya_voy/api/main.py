@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from ya_voy import __version__
 from ya_voy.api import health, webhooks
 from ya_voy.config import Settings, get_settings
-from ya_voy.db.session import create_engine
+from ya_voy.db.session import create_engine, create_session_factory
 from ya_voy.logging import configure_logging
 from ya_voy.queue import redis_settings_from_url
 
@@ -20,7 +20,8 @@ from ya_voy.queue import redis_settings_from_url
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
     app.state.engine = create_engine(settings)
-    # The arq pool doubles as the Redis client for the health check and, from stage 3, enqueueing.
+    app.state.session_factory = create_session_factory(app.state.engine)
+    # The arq pool is both the Redis client for the health check and the job enqueuer.
     app.state.redis = await create_pool(redis_settings_from_url(settings.redis_url))
     try:
         yield

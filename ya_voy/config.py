@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     outbound_max_attempts: int = Field(5, gt=0)
     data_retention_days: int = Field(90, gt=0)
 
+    # Development tooling (docs/plans/real-number-verification.md)
+    capture_inbound_payloads: bool = False
+    capture_dir: str = "data/captures"
+
     @field_validator("database_url", mode="after")
     @classmethod
     def _async_database_url(cls, value: str) -> str:
@@ -150,6 +154,8 @@ class Settings(BaseSettings):
             ]
             if missing:
                 raise ValueError(f"required in production: {', '.join(missing)}")
+            if self.capture_inbound_payloads:
+                raise ValueError("CAPTURE_INBOUND_PAYLOADS is for development only")
         return self
 
     @property

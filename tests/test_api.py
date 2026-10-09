@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 
 from tests.conftest import make_settings
-from ya_voy.api.dependencies import get_health_checks
+from ya_voy.api.dependencies import get_health_checks, get_redis, get_session_factory
 from ya_voy.api.main import create_app
 
 SECRET = "test-secret-123"
@@ -54,11 +54,14 @@ async def test_health_reports_failing_dependency(
     assert body["checks"][failing] == "error"
 
 
-async def test_webhook_accepts_valid_secret(client: httpx.AsyncClient) -> None:
-    payload = {"event": "messages.upsert", "instance": "yavoy", "data": {}}
+async def test_webhook_accepts_valid_secret(app: FastAPI, client: httpx.AsyncClient) -> None:
+    # Processing is covered in tests/test_webhook.py; an unsupported event never touches the DB.
+    app.dependency_overrides[get_session_factory] = lambda: None
+    app.dependency_overrides[get_redis] = lambda: None
+    payload = {"event": "presence.update", "instance": "yavoy", "data": {}}
     resp = await client.post(f"/webhooks/evolution/{SECRET}", json=payload)
     assert resp.status_code == 200
-    assert resp.json() == {"status": "accepted"}
+    assert resp.json() == {"status": "ignored", "reason": "unsupported_event"}
 
 
 @pytest.mark.parametrize("secret", ["wrong", SECRET + "x", SECRET[:-1], "%20"])
