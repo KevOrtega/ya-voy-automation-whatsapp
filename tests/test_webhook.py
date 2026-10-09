@@ -239,6 +239,10 @@ async def test_webhook_logs_never_contain_secret_or_message_text(
 # --- capture mode --------------------------------------------------------------------------
 
 
+def list_dir(path: Path) -> list[Path]:
+    return list(path.iterdir())
+
+
 async def _post_with(redis: FakeRedis, body: Any, **settings: Any) -> httpx.Response:
     transport = httpx.ASGITransport(app=_app(redis, **settings))
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -254,7 +258,7 @@ async def test_capture_mode_writes_every_payload_redacted(
         redis, payload, capture_inbound_payloads=True, capture_dir=str(tmp_path)
     )
     assert resp.json()["status"] == "ignored"
-    (path,) = tmp_path.iterdir()
+    (path,) = list_dir(tmp_path)
     assert path.name.endswith("_messages.upsert_" + path.name.split("_")[-1])
     content = path.read_text(encoding="utf-8")
     assert SECRET not in content
@@ -265,7 +269,7 @@ async def test_capture_mode_off_by_default(
     tmp_path: Path, store: FakeStore, redis: FakeRedis
 ) -> None:
     await _post_with(redis, load_fixture("private_text"), capture_dir=str(tmp_path))
-    assert list(tmp_path.iterdir()) == []
+    assert list_dir(tmp_path) == []
 
 
 async def test_capture_write_failure_does_not_break_the_webhook(
