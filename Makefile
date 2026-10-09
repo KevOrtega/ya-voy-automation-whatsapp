@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: help env venv up down logs ps test test-docker lint format migrate revision shell-web psql redis-cli clean
+.PHONY: help env venv up down logs ps test test-docker lint format migrate revision check-migrations shell-web psql redis-cli clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -52,6 +52,9 @@ migrate: ## Apply migrations inside Docker
 
 revision: ## Autogenerate a migration: make revision m="create orders"
 	$(COMPOSE) run --rm migrate alembic revision --autogenerate -m "$(m)"
+
+check-migrations: ## Fail if the models differ from the migrations (alembic check, in Docker)
+	$(COMPOSE) run --rm migrate alembic check
 
 shell-web: ## Open a shell in the web container
 	$(COMPOSE) exec web bash

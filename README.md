@@ -10,9 +10,10 @@ alerts, and gets a daily `.xlsx` report once all of the day's orders are resolve
 labeled correction if an order changes afterwards. There is no delivery tracking: an order
 is done once claimed.
 
-> Status: **stage 1 (development environment and skeleton)**. Docker Compose stack, FastAPI app
-> with `/health` and a stub webhook, arq worker with a placeholder job, async Alembic (no
-> migrations yet). No business logic or data model yet.
+> Status: **stage 2 (data model and migrations)**. Docker Compose dev stack, FastAPI app with
+> `/health` and a stub webhook, arq worker with a placeholder job, and the full PostgreSQL schema
+> from [docs/05](docs/05-modelo-datos.md) as SQLAlchemy models plus one Alembic migration. No
+> business logic yet.
 
 ## Stack
 

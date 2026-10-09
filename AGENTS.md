@@ -50,12 +50,16 @@ make format               # ruff check --fix . && ruff format .
 # Migrations (Alembic, async; URL from DATABASE_URL)
 make revision m="create orders table"   # alembic revision --autogenerate (in Docker)
 make migrate                            # docker compose run --rm migrate (alembic upgrade head)
+make check-migrations                   # alembic check: models and migrations must agree
 docker compose run --rm migrate alembic downgrade -1
 ```
 
 Layout: `ya_voy/` package (`api/`, `worker/`, `db/` with `migrations/`, `config.py`, `queue.py`,
-`logging.py`), `tests/`. Integration tests are marked `integration` and run only with
-`RUN_INTEGRATION=1` (set by `make test-docker`). Ports: web 8000, Evolution 8080 (manager at
+`logging.py`), `tests/`. Models: `ya_voy/db/models.py`; allowed status/kind values:
+`ya_voy/domain/enums.py` (the CHECK constraints are built from them); LLM schemas:
+`ya_voy/llm/schemas.py`. Integration tests live in `tests/integration/`, run only with
+`RUN_INTEGRATION=1` (set by `make test-docker`) and use throwaway databases (`yavoy_test`,
+`yavoy_migration_test`, `yavoy_metadata_test`), never the dev `yavoy` database. Ports: web 8000, Evolution 8080 (manager at
 `/manager`), Postgres 5432 (`yavoy`/`yavoy`, DBs `yavoy` and `evolution`), Redis 6379.
 
 ## Workflow
