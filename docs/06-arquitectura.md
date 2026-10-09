@@ -76,7 +76,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` con más de `OUTBOUND_RECOVERY_SECONDS` | Reencolar |
-| `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` (**pendiente, todavía no implementada**: ver `docs/plans/pending-before-production.md`) |
+| `apply_data_retention` | Cada hora (minuto 17) y al arrancar | Anonimizar lo más viejo que `DATA_RETENTION_DAYS`, por lotes (ver "Retención de datos") |
 
 ### Componentes internos (paquete `ya_voy`, propuesta)
 
@@ -460,13 +460,53 @@ administrador por número o `@lid` para comandos sobre el reporte (`estado` con 
 reenvío por WhatsApp); conectar T13, T16, T17 y T18 (etapas de liberación y cancelación) con
 `mark_report_for_correction`; probar el envío real del documento con Evolution.
 
-#### Retención de datos (pendiente antes de producción)
+#### Retención de datos
 
-RNF-10 / DC-11 (docs/01): a los `DATA_RETENTION_DAYS` (90) días se anonimizan direcciones, notas, textos
-de mensajes, payloads crudos y archivos de reportes, conservando códigos, estados, tiempos y conteos. La
-tarea `apply_data_retention` y su registro en el worker **todavía no existen** (`TODO(later stage)` en
-`ya_voy/worker/settings.py`); es requisito antes de producción. Detalle y criterios de aceptación en
-`docs/plans/pending-before-production.md`.
+RNF-10 / DC-11 / RNF-09 (docs/01): a los `DATA_RETENTION_DAYS` (90) días se anonimizan direcciones,
+notas, textos de mensajes, payloads crudos y archivos de reportes. **No se borra ninguna fila**: se vacían
+los campos personales y se conservan ids, estados, tiempos, claves foráneas y conteos, así el reporte de un
+día viejo sigue sumando lo mismo. Implementación: `ya_voy/retention/service.py`, tarea
+`apply_data_retention` (`ya_voy/worker/retention.py`), una vez por hora en el minuto 17 y al arrancar el
+worker.
+
+Límites (con `db_now()`): `cutoff = now - DATA_RETENTION_DAYS` para las marcas de tiempo y
+`business_date(now) - DATA_RETENTION_DAYS` para los días operativos.
+
+| Categoría | Filas | Se vacía | Nunca se toca (flujos vivos) |
+|-----------|-------|----------|------------------------------|
+| `orders` | `business_date` anterior al límite | `pickup_address`, `delivery_address`, `product`, `payment_method_raw`, `notes` (a `NULL`), `extraction` (`{}`), `validation_errors` (`[]`) | Pedidos pendientes (`draft`, `awaiting_confirmation`, `published`); pedidos de un día cuyo reporte no está `sent` ni `failed` (todavía puede corregirse). |
+| `order_events` | `created_at` anterior al límite | Claves `extraction`, `admin_jid` y `error` de `data` (se conservan emoji, campos cambiados, etc.) | Eventos de pedidos pendientes. |
+| `inbound_events` | `received_at` anterior al límite | `payload` (`{}`), `error` | Eventos `received` o `processing`. Los `failed` viejos se anonimizan y ya no se pueden reprocesar. |
+| `messages` | `created_at` anterior al límite | `body` | Mensajes de pedidos pendientes. |
+| `outbound_messages` | `created_at` anterior al límite | `body` (`''`), `last_error` | Filas `pending` o `sending`. |
+| `schedule_overrides` | `created_at` anterior al límite | `source_text` (`''`), `parsed` (`{}`), `reason` | `pending_confirmation`; cambios `active` todavía vigentes (sin fin, o que terminan después del límite). |
+| `report_revisions` | revisiones de reportes con `report_date` anterior al límite | `file_content` (el `.xlsx`, que tiene direcciones) | Reportes que no están `sent`/`failed`; revisiones con un documento en la bandeja de salida `pending`/`sending`. |
+
+Se conservan a propósito: `participant`, `sender_jid`, `recipient_jid`, `created_by` y las tablas `stores` y
+`couriers` (identidad viva del local o motero, no texto del día), `report_revisions.snapshot`/`changes`
+(solo códigos, estados y nombres de moteros; base de las correcciones), `file_name` (sin datos personales)
+y `parked_reactions` (no tiene datos personales: emoji, ids del mensaje, `courier_id`). El reporte de un
+día anonimizado ya no tiene archivo: un reenvío manual lo rearma desde los datos anonimizados (ver "Sin
+archivo" más arriba).
+
+Cada categoría avanza por lotes de `DATA_RETENTION_BATCH_SIZE` filas, una transacción corta por lote:
+`WITH batch AS (SELECT id ... WHERE anonymized_at IS NULL AND <condición> ORDER BY id LIMIT :n FOR UPDATE
+SKIP LOCKED) UPDATE ... SET <campos>, anonymized_at = now`. `anonymized_at` (índices parciales
+`*_retention_idx ... WHERE anonymized_at IS NULL`) hace la tarea idempotente: una fila ya anonimizada no
+se vuelve a tocar. `SKIP LOCKED` evita esperar a la toma de pedidos o a otra corrida: una fila bloqueada
+queda para la próxima hora, y dos corridas a la vez se reparten las filas (arq además no superpone la
+misma tarea cron). No hace falta un orden de claves foráneas porque no se borra nada.
+
+Capturas: las capturas de desarrollo (`CAPTURE_DIR`, `data/captures`, ignorada por git) más viejas que el
+límite (según la hora UTC del nombre, `20261009T031500123456Z_<evento>_<hash>.json`) se borran del disco
+después de las transacciones; una carpeta inexistente o un archivo que ya no está no es error, y los demás
+archivos (por ejemplo el mapeo `pseudonyms.json`) quedan para el operador. En producción la carpeta no
+existe. Los fixtures versionados (`tests/fixtures/evolution`) ya están anonimizados por
+`scripts/anonymize_captures.py` y no tienen datos reales.
+
+Cada corrida registra un resumen en INFO (`data retention applied`, con `anonymized_<categoría>` y
+`errors`); una categoría que falla se registra en ERROR (`data retention failed`, con `category`) y las
+demás siguen.
 
 #### Política de reintentos de la bandeja de salida
 
@@ -504,6 +544,7 @@ administrador, salvo que el mensaje fallido sea esa misma alerta. El backoff vig
 | D-17 | Reporte versionado (`report_revisions`) con correcciones por diferencia neta | Los cambios posteriores al envío se informan sin reescribir lo enviado ni mandar correcciones vacías. |
 | D-18 | Claves de idempotencia de las transiciones con el id del `order_event` | Liberar y volver a tomar avisa de nuevo; un reintento de la misma transición no puede duplicar mensajes. |
 | D-19 | `group_message_id` se guarda cuando Evolution acepta la publicación; las reacciones que llegan antes se estacionan y el gancho las aplica primero, en orden de `messageTimestamp` | Solo se puede reaccionar a un mensaje que existe, pero la primera reacción gana aunque llegue antes del commit del id; el gancho serializa con la cancelación y elimina publicaciones tardías. |
+| D-20 | La retención anonimiza sin borrar filas, por lotes con `FOR UPDATE SKIP LOCKED` y marca `anonymized_at` | Los conteos de reportes viejos no cambian; la tarea es idempotente y nunca bloquea la toma de pedidos. |
 
 ## 3. Entorno de desarrollo (Docker Compose)
 
@@ -637,6 +678,7 @@ Consideraciones:
 | `OUTBOUND_MIN_INTERVAL_MS` | `1000` | Separación mínima entre envíos. |
 | `OUTBOUND_MAX_ATTEMPTS` | `5` | |
 | `DATA_RETENTION_DAYS` | `90` | Anonimización de datos. |
+| `DATA_RETENTION_BATCH_SIZE` | `500` | Filas por transacción de la anonimización. |
 | `CAPTURE_INBOUND_PAYLOADS` | `0` | Solo desarrollo (en producción se rechaza): guarda cada payload crudo del webhook en `CAPTURE_DIR` para la verificación con número real. |
 | `CAPTURE_DIR` | `data/captures` | Carpeta de capturas (ignorada por git). |
 

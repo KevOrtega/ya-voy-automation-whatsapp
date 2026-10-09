@@ -118,6 +118,7 @@ erDiagram
         bigint inbound_event_id FK "nullable"
         jsonb data
         timestamptz created_at
+        timestamptz anonymized_at
     }
 
     inbound_events {
@@ -132,6 +133,7 @@ erDiagram
         int attempts
         text error
         timestamptz received_at
+        timestamptz anonymized_at
         timestamptz processed_at
     }
 
@@ -150,6 +152,7 @@ erDiagram
         bigint inbound_event_id FK
         bigint outbound_message_id FK
         timestamptz created_at
+        timestamptz anonymized_at
     }
 
     outbound_messages {
@@ -168,6 +171,7 @@ erDiagram
         text last_error
         text wa_message_id
         timestamptz created_at
+        timestamptz anonymized_at
         timestamptz sent_at
     }
 
@@ -202,6 +206,7 @@ erDiagram
         timestamptz generated_at
         timestamptz sent_at
         timestamptz created_at
+        timestamptz anonymized_at
     }
 
     schedule_overrides {
@@ -222,6 +227,7 @@ erDiagram
         timestamptz cancelled_at
         bigint cancelled_by_override_id FK
         timestamptz created_at
+        timestamptz anonymized_at
     }
 
     parked_reactions {
@@ -317,7 +323,7 @@ Para enviar privados al motero se usa `phone_jid` si existe; si no, `lid` (ver r
 | `unclaimed_alert_sent_at` | `timestamptz` | nullable | No nulo = ya se alertó en este período de publicación. |
 | `assigned_at`, `cancelled_at` | `timestamptz` | nullable | |
 | `cancelled_by` | `text` | nullable, `CHECK (cancelled_by IN ('store','admin'))` | |
-| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10). |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): direcciones, producto, medio de pago, notas, `extraction` y `validation_errors` vaciados. |
 | `created_at`, `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 
 Restricciones adicionales:
@@ -349,6 +355,7 @@ ALTER TABLE orders ADD CONSTRAINT orders_code_when_published CHECK (
 | `(store_id, created_at DESC)` | Pedidos activos del local. |
 | `(business_date) WHERE status IN ('draft','awaiting_confirmation','published')` | Pedidos pendientes que retienen el reporte o su corrección. |
 | `(business_date)` | Contenido del reporte diario. |
+| `orders_retention_idx (business_date) WHERE anonymized_at IS NULL` | Retención (docs/06). |
 
 ### `order_events` (auditoría)
 
@@ -362,10 +369,12 @@ ALTER TABLE orders ADD CONSTRAINT orders_code_when_published CHECK (
 | `courier_id` | `bigint` | FK → `couriers.id`, nullable | Motero afectado por el evento (base del resumen por motero del reporte). |
 | `from_status`, `to_status` | `text` | nullable | Nulos si el evento no cambia el estado. |
 | `inbound_event_id` | `bigint` | FK → `inbound_events.id`, nullable | Evento que lo originó. |
-| `data` | `jsonb` | `NOT NULL DEFAULT '{}'` | Emoji, campos cambiados, número del admin, etc. |
+| `data` | `jsonb` | `NOT NULL DEFAULT '{}'` | Emoji, campos cambiados, número del admin, etc. Por retención se quitan `extraction`, `admin_jid` y `error`. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): se quitan de `data` las claves `extraction`, `admin_jid` y `error`. |
 
-Índices: `(order_id, created_at)`, `(created_at, courier_id)` (reporte diario).
+Índices: `(order_id, created_at)`, `(created_at, courier_id)` (reporte diario),
+`order_events_retention_idx (created_at) WHERE anonymized_at IS NULL`.
 
 Mapeo al resumen del reporte (por `courier_id`, sobre los pedidos con `business_date = D`, RN-21):
 
@@ -393,8 +402,10 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 | `error` | `text` | nullable | |
 | `received_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 | `processed_at` | `timestamptz` | nullable | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `payload` queda `{}` y `error` nulo. |
 
-Índice: `(status, received_at) WHERE status IN ('received','failed')` para el barrido de recuperación.
+Índices: `(status, received_at) WHERE status IN ('received','failed')` para el barrido de recuperación;
+`inbound_events_retention_idx (received_at) WHERE anonymized_at IS NULL`.
 
 > **A verificar en la implementación:** si al quitar una reacción WhatsApp reutiliza el mismo `key.id`
 > de la reacción original, la deduplicación por `wa_message_id` descartaría la remoción. En ese caso
@@ -427,8 +438,8 @@ D-19.
 | `resolved_at` | `timestamptz` | nullable | Cuando se aplicó o descartó. |
 
 Índice: `parked_reactions_pending_target_idx (group_message_id, reacted_at) WHERE status = 'pending'`.
-Retención (RNF-10): las filas resueltas no tienen datos personales más allá del `courier_id`; se
-borran o anonimizan junto con lo demás (pendiente, ver `docs/plans/pending-before-production.md`).
+Retención (RNF-10): no tiene datos personales (emoji, ids de mensajes, `courier_id`); la retención no la
+toca ni borra filas (docs/06, "Retención de datos").
 
 ### `messages` (historial de conversación)
 
@@ -446,8 +457,10 @@ borran o anonimizan junto con lo demás (pendiente, ver `docs/plans/pending-befo
 | `inbound_event_id` | `bigint` | FK → `inbound_events.id`, nullable | Si `direction = 'in'`. |
 | `outbound_message_id` | `bigint` | FK → `outbound_messages.id`, nullable | Si `direction = 'out'`. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` nulo. |
 
-Índices: `(chat_jid, created_at)`, `(order_id)`, `(wa_message_id)`.
+Índices: `(chat_jid, created_at)`, `(order_id)`, `(wa_message_id)`,
+`messages_retention_idx (created_at) WHERE anonymized_at IS NULL`.
 
 Restricciones adicionales (el evento de origen solo existe para los mensajes entrantes y la fila de la
 bandeja de salida solo para los salientes; ninguno de los dos es obligatorio):
@@ -479,9 +492,11 @@ ALTER TABLE messages ADD CONSTRAINT messages_outbound_message_only_out
 | `wa_message_id` | `text` | nullable | `key.id` devuelto por Evolution. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 | `sent_at` | `timestamptz` | nullable | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `body` queda vacío y `last_error` nulo. |
 
 Índices: `(status, created_at) WHERE status IN ('pending','failed')`, `(wa_message_id)`,
-`(recipient_jid, id) WHERE status IN ('pending','sending')` (orden FIFO por destinatario).
+`(recipient_jid, id) WHERE status IN ('pending','sending')` (orden FIFO por destinatario),
+`outbound_messages_retention_idx (created_at) WHERE anonymized_at IS NULL`.
 
 Restricciones adicionales (`delete` y `edit` actúan sobre un mensaje propio existente; un documento es
 siempre el archivo de una revisión del reporte):
@@ -536,6 +551,7 @@ Cada versión del reporte. La revisión 1 es el original; las siguientes son cor
 | `last_error` | `text` | nullable | |
 | `generated_at`, `sent_at` | `timestamptz` | nullable | |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención: `file_content` borrado (el archivo tiene direcciones). |
 
 Cálculo de cambios (`diff_snapshots(previous, current)`), por pedido publicado del día:
 
@@ -593,6 +609,7 @@ Cada instrucción de horario del administrador, con su interpretación y su cicl
 | `cancelled_at` | `timestamptz` | nullable | Levantado por un `reopen`. |
 | `cancelled_by_override_id` | `bigint` | FK → `schedule_overrides.id`, nullable | El `reopen` que lo levantó. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `anonymized_at` | `timestamptz` | nullable | Retención (RNF-10): `source_text` vacío, `parsed` `{}`, `reason` nulo. |
 
 Restricciones e índices:
 

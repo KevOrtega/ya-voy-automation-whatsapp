@@ -3,7 +3,7 @@
 Tareas que no pertenecen a una etapa ya entregada pero que **deben** estar hechas antes de poner el bot
 en producción con el número real del cliente. Cada una cita los requisitos que la exigen.
 
-## 1. Retención de datos (`apply_data_retention`)
+## 1. Retención de datos (`apply_data_retention`) — hecha
 
 **Requisitos:** RNF-10 y DC-11 (docs/01): a los `DATA_RETENTION_DAYS` (90) días se anonimizan direcciones,
 notas, textos de mensajes, payloads crudos y archivos de reportes; se conservan códigos, estados, tiempos y
@@ -11,9 +11,14 @@ conteos. Relacionados: RNF-09 (privacidad), docs/05 (`orders.anonymized_at`, `me
 `report_revisions.file_content`, `parked_reactions`), docs/06 (tabla de tareas programadas y sección
 "Retención de datos").
 
-**Estado:** sin implementar. `DATA_RETENTION_DAYS` ya existe en la configuración
-(`ya_voy/config.py`), pero la tarea no está escrita ni registrada (`TODO(later stage)` en
-`ya_voy/worker/settings.py`).
+**Estado:** hecha (rama `data-retention`). `ya_voy/retention/service.py` y la tarea cron
+`apply_data_retention` (cada hora en el minuto 17 y al arrancar), migración `0004` (columnas
+`anonymized_at` e índices parciales), `DATA_RETENTION_BATCH_SIZE`, tests en
+`tests/integration/test_retention.py`. Diseño y decisiones en docs/06, "Retención de datos" (D-20).
+Diferencias con el alcance original de abajo, por indicación de la auditoría: no se borra ninguna fila
+(tampoco `report_revisions` ni `parked_reactions`, que además no tienen datos personales); se anonimizan
+también los mensajes, eventos y cambios de horario viejos aunque el día no esté cerrado, salvo los ligados a
+flujos vivos; y las capturas de desarrollo viejas de `CAPTURE_DIR` se borran del disco.
 
 **Alcance mínimo:**
 
