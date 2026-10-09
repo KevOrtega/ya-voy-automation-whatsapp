@@ -32,6 +32,9 @@ class OrderResult:
     outcome: str
     order_id: int | None = None
     outbound_ids: list[int] = field(default_factory=list)
+    # A reaction parked for a post id not known yet: enqueue its first deferred retry after the
+    # commit (``worker.orders.enqueue_parked_retry``).
+    parked_id: int | None = None
 
 
 async def now(session: AsyncSession) -> dt.datetime:

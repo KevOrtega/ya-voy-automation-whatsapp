@@ -2,10 +2,11 @@
 unclaimed-order alert (CU-08, T15).
 
 ``group_message_id`` is the WhatsApp id of the group post, known only once Evolution accepted it:
-:func:`on_group_message_sent` stores it (reactions can only find the order from then on) and
-starts the unclaimed-alert period then (CU-03 4a). The hook locks the order row, so it is
-serialized with a cancellation: a group message of a cancelled order that is sent late (it was
-still in the outbox when the order was cancelled) gets its delete right away.
+:func:`on_group_message_sent` stores it, applies first the reactions parked while it was unknown
+(``ya_voy.orders.parking``, D-19) and starts the unclaimed-alert period then (CU-03 4a). The
+hook locks the order row, so it is serialized with a cancellation: a group message of a
+cancelled order that is sent late (it was still in the outbox when the order was cancelled) gets
+its delete right away.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from ya_voy.domain.enums import ActorType, OrderEventType, OrderStatus, Outbound
 from ya_voy.messaging import catalog
 from ya_voy.messaging import order_texts as texts
 from ya_voy.messaging.outbox import enqueue_admin_alert
+from ya_voy.orders import parking
 from ya_voy.orders.cancellation import enqueue_group_delete
 from ya_voy.orders.notify import OrderResult, Outbox, add_event, key, now
 from ya_voy.schedule import repository as schedule_repository
@@ -125,6 +127,15 @@ async def on_group_message_sent(
     """In ``send_outbound``'s transaction, after ``row`` became ``sent``."""
     if not _is_group_order_message(settings, row):
         return []
+    is_post = (
+        row.template_key == catalog.GROUP_ORDER_POST
+        and row.message_type == OutboundMessageType.TEXT
+        and row.wa_message_id is not None
+    )
+    if is_post:
+        # Before the order row (lock order of ya_voy.orders.parking): reactions to this id wait.
+        assert row.wa_message_id is not None
+        await parking.lock_target(session, row.wa_message_id)
     order = await session.scalar(select(Order).where(Order.id == row.order_id).with_for_update())
     assert order is not None
     at = await now(session)
@@ -145,15 +156,20 @@ async def on_group_message_sent(
         return []
     if row.message_type != OutboundMessageType.TEXT or row.wa_message_id is None:
         return []
-    if row.template_key == catalog.GROUP_ORDER_POST and order.group_message_id is None:
+    out = Outbox(session)
+    if is_post and order.group_message_id is None:
         order.group_message_id = row.wa_message_id
         if order.status == S.PUBLISHED and order.unclaimed_alert_sent_at is None:
             # CU-03 4a: the unclaimed period starts when the post is really in the group.
             order.unclaimed_alert_at = at + dt.timedelta(minutes=settings.unclaimed_alert_minutes)
-    if order.status != S.CANCELLED:
-        return []
-    out = Outbox(session)  # sent after the cancellation listed the group messages: delete it too
-    await enqueue_group_delete(out, settings, order, row.wa_message_id)
+        await session.flush()
+        # Reactions that arrived before this commit go first, in WhatsApp order (D-19).
+        for result in await parking.apply_parked(session, settings, row.wa_message_id, order.id):
+            out.extend(result.outbound_ids)
+        await session.refresh(order)
+    if order.status == S.CANCELLED:
+        # Sent after the cancellation listed the group messages: delete it too.
+        await enqueue_group_delete(out, settings, order, row.wa_message_id)
     return out.ids
 
 

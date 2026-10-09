@@ -29,6 +29,7 @@ EXPECTED_TABLES = {
     "daily_reports",
     "report_revisions",
     "schedule_overrides",
+    "parked_reactions",
 }
 
 # Constraint and index names written verbatim in docs/05-modelo-datos.md.

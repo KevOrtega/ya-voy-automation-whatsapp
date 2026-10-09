@@ -62,6 +62,17 @@ class OrderEventType(StrEnum):
     EXPIRED = "expired"
 
 
+class ParkedReactionKind(StrEnum):
+    ADDED = "added"
+    REMOVED = "removed"
+
+
+class ParkedReactionStatus(StrEnum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    DISCARDED = "discarded"
+
+
 class InboundEventStatus(StrEnum):
     RECEIVED = "received"
     PROCESSING = "processing"

@@ -42,6 +42,8 @@ from ya_voy.domain.enums import (
     OrderStatus,
     OutboundMessageType,
     OutboundStatus,
+    ParkedReactionKind,
+    ParkedReactionStatus,
     PaymentMethod,
     ReportRevisionKind,
     ReportRevisionStatus,
@@ -440,6 +442,41 @@ class ScheduleOverride(Base):
     created_at: Mapped[dt.datetime] = _ts_now()
 
 
+class ParkedReaction(Base):
+    """A group reaction whose target message was not yet a known order post (docs/06, D-19).
+
+    Applied, in ``reacted_at`` order, when the post's ``group_message_id`` is recorded; retried a
+    few times and then discarded if it never matches (``ya_voy.orders.parking``).
+    """
+
+    __tablename__ = "parked_reactions"
+    __table_args__ = (
+        CheckConstraint(sql_in("kind", ParkedReactionKind), name="kind_check"),
+        CheckConstraint(sql_in("status", ParkedReactionStatus), name="status_check"),
+        CheckConstraint("kind = 'removed' OR emoji IS NOT NULL", name="emoji_when_added"),
+        Index(
+            "parked_reactions_pending_target_idx",
+            "group_message_id",
+            "reacted_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
+
+    id: Mapped[int] = _pk()
+    group_message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    courier_id: Mapped[int] = _fk("couriers.id", nullable=False)
+    emoji: Mapped[str | None] = mapped_column(Text)
+    inbound_event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("inbound_events.id"), unique=True
+    )
+    reacted_at: Mapped[dt.datetime] = _ts(nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    attempts: Mapped[int] = _int0()
+    created_at: Mapped[dt.datetime] = _ts_now()
+    resolved_at: Mapped[dt.datetime | None] = _ts()
+
+
 __all__ = [
     "Base",
     "Courier",
@@ -449,6 +486,7 @@ __all__ = [
     "Order",
     "OrderEvent",
     "OutboundMessage",
+    "ParkedReaction",
     "ReportRevision",
     "ScheduleOverride",
     "Store",

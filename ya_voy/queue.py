@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 PROCESS_INBOUND_EVENT = "process_inbound_event"
 SEND_OUTBOUND = "send_outbound"
 EVALUATE_DRAFT = "evaluate_draft"
+RETRY_PARKED_REACTION = "retry_parked_reaction"
 
 
 def redis_settings_from_url(url: str) -> RedisSettings:
@@ -35,6 +36,14 @@ async def enqueue_send_outbound(
 async def enqueue_evaluate_draft(redis: ArqRedis, order_id: int, *, defer_by: timedelta) -> None:
     """RF-15: one deferred evaluation per store message; stale ones see a newer message and skip."""
     await redis.enqueue_job(EVALUATE_DRAFT, order_id, _defer_by=defer_by)
+
+
+async def enqueue_retry_parked_reaction(
+    redis: ArqRedis, parked_reaction_id: int, *, defer_by: timedelta
+) -> None:
+    """A reaction waiting for its group post id (``ya_voy.orders.parking``); retries are
+    idempotent (a resolved row is skipped), so duplicates are harmless."""
+    await redis.enqueue_job(RETRY_PARKED_REACTION, parked_reaction_id, _defer_by=defer_by)
 
 
 async def enqueue_outbound_ids(redis: ArqRedis, outbound_message_ids: Iterable[int]) -> None:

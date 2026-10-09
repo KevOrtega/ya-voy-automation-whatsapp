@@ -32,11 +32,6 @@ logger = logging.getLogger(__name__)
 S = OrderStatus
 
 
-async def _order_id_for_post(session: AsyncSession, group_message_id: str) -> int | None:
-    """RN-12: only reactions on an order's group post count (not on the bot's replies)."""
-    return await session.scalar(select(Order.id).where(Order.group_message_id == group_message_id))
-
-
 async def _already_applied(
     session: AsyncSession, order_id: int, inbound_event_id: int | None
 ) -> bool:
@@ -65,13 +60,16 @@ async def _load(session: AsyncSession, order_id: int) -> tuple[Order, Store]:
     return order, store
 
 
-async def handle_reaction_added(
-    session: AsyncSession, settings: Settings, event: ReactionAdded
+async def order_id_for_post(session: AsyncSession, group_message_id: str) -> int | None:
+    """RN-12: only reactions on an order's group post count (not on the bot's replies)."""
+    return await session.scalar(select(Order.id).where(Order.group_message_id == group_message_id))
+
+
+async def apply_added(
+    session: AsyncSession, settings: Settings, event: ReactionAdded, order_id: int
 ) -> OrderResult:
-    """T10 (claim), or T11 / T12 / T19 when the claim finds no row."""
-    order_id = await _order_id_for_post(session, event.group_message_id)
-    if order_id is None:
-        return OrderResult("ignored:not_an_order_post")
+    """T10 (claim), or T11 / T12 / T19 when the claim finds no row. ``order_id`` is the order
+    whose post the reaction targets (``ya_voy.orders.parking.handle_reaction`` resolves it)."""
     courier = await session.get(Courier, event.courier_id)
     if courier is None:
         raise ValueError(f"courier {event.courier_id} does not exist")
@@ -265,13 +263,10 @@ async def _released_messages(
     )
 
 
-async def handle_reaction_removed(
-    session: AsyncSession, settings: Settings, event: ReactionRemoved
+async def apply_removed(
+    session: AsyncSession, settings: Settings, event: ReactionRemoved, order_id: int
 ) -> OrderResult:
     """T13 when the remover is the assigned courier; otherwise nothing (T14, RN-04, RN-06)."""
-    order_id = await _order_id_for_post(session, event.group_message_id)
-    if order_id is None:
-        return OrderResult("ignored:not_an_order_post")
     if await _already_applied(session, order_id, event.inbound_event_id):
         return OrderResult("duplicate", order_id)
     courier = await session.get(Courier, event.courier_id)

@@ -91,8 +91,11 @@ async def _process_locked(
         # @lid, docs/05 courier upsert and merge), then in THIS transaction
         #   result = await orders.apply_reaction(session, settings, ReactionAdded(
         #       group_message_id=event.reaction_target_id, courier_id=..., emoji=...,
-        #       inbound_event_id=row.id))  (ReactionRemoved for a removal)
-        # and outbound_ids += result.outbound_ids. Emoji-change payloads (a new reaction with no
+        #       inbound_event_id=row.id, reacted_at=<messageTimestamp>))  (ReactionRemoved for a
+        # removal), outbound_ids += result.outbound_ids, and after the commit
+        # orders.enqueue_parked_retry(ctx, result) (a reaction to a post whose id is not committed
+        # yet is parked, docs/06 D-19). Drop reactions whose reactionMessage.key.fromMe is false
+        # first (not a bot message: nothing to park). Emoji-change payloads (a new reaction with no
         # removal, or a removal followed by a new reaction) must be confirmed there too.
         # TODO(stage-7b): an admin (ADMIN_PHONES, by number or @lid) -> the same pattern with
         #   schedules.handle_admin_text(ctx, schedule_admin.AdminText(admin_phone=...,

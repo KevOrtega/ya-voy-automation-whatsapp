@@ -24,7 +24,7 @@ from tests.integration.conftest import EVOLUTION_URL, queued
 from tests.llm_stubs import StubExtractor
 from tests.schedule_helpers import at
 from ya_voy.db import models as m
-from ya_voy.orders import cancellation, claims
+from ya_voy.orders import cancellation, claims, parking
 from ya_voy.orders.events import ReactionAdded, ReactionRemoved
 from ya_voy.queue import SEND_OUTBOUND
 from ya_voy.schedule import repository as schedule_repository
@@ -341,7 +341,18 @@ async def test_reactions_on_other_messages_and_by_blocked_couriers_are_ignored(
     ctx: dict[str, Any], world: World, engine: AsyncEngine
 ) -> None:
     order_id = await world.order()
-    assert (await react(world, ctx, "Motero0", post="SOMETHING-ELSE")).outcome == (
+    await f.insert_ok(
+        engine,
+        f.outbound(
+            template_key="group_order_assigned",
+            recipient_jid=GROUP,
+            order_id=order_id,
+            status="sent",
+            wa_message_id="BOT-REPLY",
+        ),
+    )
+    # RN-12: a bot reply that WhatsApp already has an id for is not a post; nothing to wait for.
+    assert (await react(world, ctx, "Motero0", post="BOT-REPLY")).outcome == (
         "ignored:not_an_order_post"
     )
     async with engine.begin() as conn:
@@ -353,7 +364,7 @@ async def test_reactions_on_other_messages_and_by_blocked_couriers_are_ignored(
     assert (await react(world, ctx, "Motero1")).outcome == "ignored:courier_blocked"
     order = await get_order(ctx["session_factory"], order_id)
     assert (order.status, order.courier_id) == ("published", None)
-    assert await outbox(ctx["session_factory"]) == []
+    assert len(await outbox(ctx["session_factory"])) == 1  # only the bot reply
 
 
 # --- release (T13, T14) and retake ------------------------------------------------------------
@@ -601,7 +612,7 @@ async def test_cancel_waits_for_a_claim_holding_the_row(ctx: dict[str, Any], wor
     order_id = await world.order()
     sf = ctx["session_factory"]
     async with sf() as session, session.begin():
-        claim = await claims.handle_reaction_added(
+        claim = await parking.handle_reaction(
             session, ctx["settings"], ReactionAdded(POST, world.couriers["Motero0"], "👍")
         )
         assert claim.outcome == "claimed"
@@ -829,9 +840,6 @@ async def test_confirmation_publishes_and_the_sent_post_enables_claims(
         "confirmed",
         "published",
     ]
-    # Until the post is in the group no reaction can point at it.
-    assert (await react(world, ctx, "Motero0")).outcome == "ignored:not_an_order_post"
-
     clock.now = at(9, 15, 2)
     assert await deliver(ctx) == ["sent", "sent"]
     order = await get_order(ctx["session_factory"], order_id)
@@ -1104,3 +1112,266 @@ async def test_unclaimed_alert_skips_assigned_and_cancelled(
     await world.order(status="assigned", courier="Motero0", code="YV-0001", group_message_id="P1")
     await world.order(status="cancelled", code="YV-0002", group_message_id="P2")
     assert await order_jobs.alert_unclaimed_orders(ctx) == 0
+
+
+# --- reactions before the post id is recorded (D-19, ya_voy.orders.parking) ------------------
+
+NEW_POST = "POST-FROM-EVOLUTION"
+
+
+async def pending_post(world: World, engine: AsyncEngine) -> tuple[int, int]:
+    """A published order whose group post is still in the outbox (no ``group_message_id``)."""
+    order_id = await world.order(group_message_id=None)
+    post_id = await f.insert_ok(
+        engine,
+        f.outbound(
+            template_key="group_order_post",
+            recipient_jid=GROUP,
+            order_id=order_id,
+            body=POST_BODY,
+        ),
+    )
+    return order_id, post_id
+
+
+class Gate:
+    """Evolution's sendText for the post: answers with ``NEW_POST``, optionally only after the
+    test opens the gate (the post is "accepted" but ``send_outbound`` has not committed)."""
+
+    def __init__(self, evo: respx.MockRouter, *, hold: bool) -> None:
+        self.called = asyncio.Event()
+        self.release = asyncio.Event()
+        if not hold:
+            self.release.set()
+        evo.routes["sendText"].mock(side_effect=self.respond)
+
+    async def respond(self, request: httpx.Request) -> httpx.Response:
+        self.called.set()
+        await self.release.wait()
+        return httpx.Response(201, json={"key": {"id": NEW_POST, "fromMe": True}})
+
+
+def ts(second: int) -> dt.datetime:
+    return at(9, 15) + dt.timedelta(seconds=second)
+
+
+def on_new(second: int, inbound_event_id: int | None = None) -> dict[str, Any]:
+    """Event fields of a reaction on ``NEW_POST`` sent at ``ts(second)``."""
+    return {"post": NEW_POST, "reacted_at": ts(second), "inbound_event_id": inbound_event_id}
+
+
+async def parked_rows(sf: SF) -> list[tuple[int, str, int]]:
+    async with sf() as session:
+        rows = await session.scalars(select(m.ParkedReaction).order_by(m.ParkedReaction.id))
+        return [(r.courier_id, r.status, r.attempts) for r in rows]
+
+
+async def retries(ctx: dict[str, Any]) -> list[tuple]:
+    return [args for _, args in await queued(ctx["redis"], "retry_parked_reaction")]
+
+
+async def test_reaction_processed_before_the_post_id_commits_wins(
+    ctx: dict[str, Any], world: World, engine: AsyncEngine, evo: respx.MockRouter
+) -> None:
+    """Evolution accepted the post but ``send_outbound`` has not committed ``group_message_id``:
+    the first reaction is parked, the hook applies it when the id commits, and a later reaction
+    (processed after the commit) loses."""
+    order_id, post_id = await pending_post(world, engine)
+    gate = Gate(evo, hold=True)
+    sending = asyncio.create_task(send_outbound(ctx, post_id))
+    await asyncio.wait_for(gate.called.wait(), 5)
+
+    try:
+        first = await react(world, ctx, "Motero0", post=NEW_POST, reacted_at=ts(1))
+        before_commit = (await get_order(ctx["session_factory"], order_id)).courier_id
+    finally:
+        gate.release.set()  # never leave send_outbound waiting on Evolution
+        sent = await sending
+    assert (first.outcome, first.order_id, first.outbound_ids) == ("parked", None, [])
+    assert first.parked_id is not None
+    assert await retries(ctx) == [(first.parked_id,)]
+    assert before_commit is None
+    assert sent == "sent"
+    order = await get_order(ctx["session_factory"], order_id)
+    assert (order.group_message_id, order.status, order.courier_id) == (
+        NEW_POST,
+        "assigned",
+        world.couriers["Motero0"],
+    )
+    claim_rows = [r for r in await outbox(ctx["session_factory"]) if r.id != post_id]
+    assert messages(claim_rows) == assigned_messages(world, "Motero0")
+    assert claim_rows[2].quoted_wa_message_id == NEW_POST
+    queued_ids = {a[0] for _, a in await queued(ctx["redis"], SEND_OUTBOUND)}
+    assert {r.id for r in claim_rows} <= queued_ids  # enqueued after send_outbound's commit
+
+    later = await react(world, ctx, "Motero1", post=NEW_POST, reacted_at=ts(2))
+    assert later.outcome == "rejected:already_taken"
+
+    # The deferred retry finds the reaction already applied: nothing more.
+    assert await order_jobs.retry_parked_reaction(ctx, first.parked_id) == "ignored:applied"
+    assert await parked_rows(ctx["session_factory"]) == [(world.couriers["Motero0"], "applied", 0)]
+    assert [e[0] for e in await events(ctx["session_factory"], order_id)] == [
+        "claimed",
+        "claim_rejected",
+    ]
+
+
+async def test_parked_reactions_apply_in_whatsapp_order(
+    ctx: dict[str, Any], world: World, engine: AsyncEngine, evo: respx.MockRouter
+) -> None:
+    """Processed in the opposite order of their ``messageTimestamp``: the earlier one wins.
+    Equal timestamps fall back to arrival order (``inbound_event_id``)."""
+    order_id, post_id = await pending_post(world, engine)
+    Gate(evo, hold=False)
+    late_event, early_event = await world.inbound(), await world.inbound()
+    assert (await react(world, ctx, "Motero0", **on_new(5, late_event))).outcome == "parked"
+    assert (await react(world, ctx, "Motero1", **on_new(3, early_event))).outcome == "parked"
+    assert (await react(world, ctx, "Motero2", post=NEW_POST, reacted_at=ts(3))).outcome == (
+        "parked"
+    )
+
+    assert await send_outbound(ctx, post_id) == "sent"
+
+    order = await get_order(ctx["session_factory"], order_id)
+    assert (order.status, order.courier_id) == ("assigned", world.couriers["Motero1"])
+    evs = await events(ctx["session_factory"], order_id)
+    assert evs == [
+        ("claimed", world.couriers["Motero1"]),
+        ("claim_rejected", world.couriers["Motero2"]),  # same timestamp, no inbound id: after
+        ("claim_rejected", world.couriers["Motero0"]),
+    ]
+    assert [s for _, s, _ in await parked_rows(ctx["session_factory"])] == ["applied"] * 3
+
+
+async def test_a_reaction_arriving_while_the_hook_records_the_id_waits_for_it(
+    ctx: dict[str, Any],
+    world: World,
+    engine: AsyncEngine,
+    evo: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overtaking: a reaction parked before the id was known and a later one that arrives while
+    the hook is recording the id. The later one waits on the target's advisory lock, then sees
+    the id; the hook has already applied the parked one, so the earlier reaction wins."""
+    order_id, post_id = await pending_post(world, engine)
+    Gate(evo, hold=False)
+    first = await react(world, ctx, "Motero0", post=NEW_POST, reacted_at=ts(1))
+    assert first.outcome == "parked"
+
+    in_hook, resume = asyncio.Event(), asyncio.Event()
+    original = parking.apply_parked
+
+    async def paused(*args: Any, **kw: Any) -> Any:
+        in_hook.set()
+        await resume.wait()
+        return await original(*args, **kw)
+
+    monkeypatch.setattr(parking, "apply_parked", paused)
+    sending = asyncio.create_task(send_outbound(ctx, post_id))
+    await asyncio.wait_for(in_hook.wait(), 5)
+    monkeypatch.setattr(parking, "apply_parked", original)
+
+    later = asyncio.create_task(react(world, ctx, "Motero1", post=NEW_POST, reacted_at=ts(2)))
+    try:
+        await asyncio.sleep(0.3)
+        blocked = not later.done()  # waiting on the advisory lock the hook holds
+    finally:
+        resume.set()  # never leave send_outbound paused (it holds row locks)
+        sent = await sending
+        outcome = (await later).outcome
+    assert blocked
+    assert (sent, outcome) == ("sent", "rejected:already_taken")
+    order = await get_order(ctx["session_factory"], order_id)
+    assert order.courier_id == world.couriers["Motero0"]
+
+
+@pytest.mark.parametrize("attempt", range(5))
+async def test_reactions_racing_the_post_commit_first_parked_wins(
+    ctx: dict[str, Any], world: World, engine: AsyncEngine, evo: respx.MockRouter, attempt: int
+) -> None:
+    """Reactions racing the post's commit: whatever the interleaving, exactly one assignment,
+    and if a reaction was parked the earliest parked one (by timestamp) is the winner."""
+    order_id, post_id = await pending_post(world, engine)
+    gate = Gate(evo, hold=True)
+    sending = asyncio.create_task(send_outbound(ctx, post_id))
+    await asyncio.wait_for(gate.called.wait(), 5)
+    early = asyncio.create_task(react(world, ctx, "Motero0", post=NEW_POST, reacted_at=ts(1)))
+    try:
+        await asyncio.sleep(0.01 * attempt)
+    finally:
+        gate.release.set()
+    others = [
+        asyncio.create_task(react(world, ctx, n, post=NEW_POST, reacted_at=ts(2 + i)))
+        for i, n in enumerate(("Motero1", "Motero2"))
+    ]
+    results = [await early, *[await t for t in others]]
+    assert await sending == "sent"
+    order = await get_order(ctx["session_factory"], order_id)
+    assert order.status == "assigned"
+    claims_ = [e for e in await events(ctx["session_factory"], order_id) if e[0] == "claimed"]
+    assert len(claims_) == 1
+    if results[0].outcome == "parked":
+        assert order.courier_id == world.couriers["Motero0"]
+    assert sum(r.outcome == "claimed" for r in results) <= 1
+
+
+async def test_a_reaction_on_an_unknown_message_is_discarded_after_the_last_retry(
+    ctx: dict[str, Any], world: World, caplog: pytest.LogCaptureFixture
+) -> None:
+    result = await react(world, ctx, "Motero0", post="NEVER-AN-ORDER-POST")
+    assert result.outcome == "parked"
+    parked_id = result.parked_id
+    assert await retries(ctx) == [(parked_id,)]
+
+    outcomes = [await order_jobs.retry_parked_reaction(ctx, parked_id) for _ in range(3)]
+    assert outcomes == ["parked", "parked", "discarded"]
+    assert await retries(ctx) == [(parked_id,)] * 3  # the first one plus two re-enqueues
+    assert await parked_rows(ctx["session_factory"]) == [
+        (world.couriers["Motero0"], "discarded", 3)
+    ]
+    assert any("parked reaction discarded" in r.getMessage() for r in caplog.records)
+    assert await order_jobs.retry_parked_reaction(ctx, parked_id) == "ignored:discarded"
+    assert await outbox(ctx["session_factory"]) == []
+
+
+async def test_a_retry_applies_the_reaction_once_the_post_is_known(
+    ctx: dict[str, Any], world: World, engine: AsyncEngine
+) -> None:
+    """Fallback path: the post id became known without the hook applying the parked reaction."""
+    order_id = await world.order(group_message_id=None)
+    result = await react(world, ctx, "Motero0", post="LATE-POST")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(m.Order).where(m.Order.id == order_id).values(group_message_id="LATE-POST")
+        )
+    assert await order_jobs.retry_parked_reaction(ctx, result.parked_id) == "applied"
+    order = await get_order(ctx["session_factory"], order_id)
+    assert order.courier_id == world.couriers["Motero0"]
+    assert len(await outbox(ctx["session_factory"])) == 3
+
+
+async def test_parked_removal_and_duplicates(
+    ctx: dict[str, Any], world: World, engine: AsyncEngine, evo: respx.MockRouter
+) -> None:
+    """A removal waits like an addition and is applied after it (timestamp order); a redelivered
+    parked event is parked once and gets a single chain of retries."""
+    order_id, post_id = await pending_post(world, engine)
+    Gate(evo, hold=False)
+    added, removed = await world.inbound(), await world.inbound()
+    first = await react(world, ctx, "Motero0", **on_new(1, added))
+    again = await react(world, ctx, "Motero0", **on_new(1, added))
+    assert (first.outcome, again.outcome, again.parked_id) == ("parked", "parked", None)
+    gone = await unreact(world, ctx, "Motero0", **on_new(4, removed))
+    assert gone.outcome == "parked"
+    assert len(await retries(ctx)) == 2
+
+    assert await send_outbound(ctx, post_id) == "sent"
+    order = await get_order(ctx["session_factory"], order_id)
+    assert (order.status, order.courier_id) == ("published", None)
+    assert [e[0] for e in await events(ctx["session_factory"], order_id)] == [
+        "claimed",
+        "released_by_courier",
+    ]
+    # Redelivered once more after the id is known: duplicate of what the hook applied.
+    assert (await react(world, ctx, "Motero0", **on_new(1, added))).outcome == "duplicate"
+    assert await order_jobs.retry_parked_reaction(ctx, gone.parked_id) == "ignored:applied"

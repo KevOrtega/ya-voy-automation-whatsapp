@@ -2,11 +2,13 @@
 
 Stage 5b builds them from ``messages.upsert`` reactions: it resolves ``reactionMessage.key.id``
 to ``group_message_id`` and the participant (``@lid`` or phone JID, with ``pushName``) to a
-``couriers`` row, creating it if needed (RF-22, CU-04 step 3).
+``couriers`` row, creating it if needed (RF-22, CU-04 step 3), and ``messageTimestamp`` to
+``reacted_at``.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 
 
@@ -18,6 +20,9 @@ class ReactionAdded:
     courier_id: int
     emoji: str
     inbound_event_id: int | None = None
+    # WhatsApp's messageTimestamp of the reaction; orders reactions parked before the group post
+    # id was known (``ya_voy.orders.parking``). ``None``: the time it is processed.
+    reacted_at: dt.datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -27,3 +32,4 @@ class ReactionRemoved:
     group_message_id: str
     courier_id: int
     inbound_event_id: int | None = None
+    reacted_at: dt.datetime | None = None

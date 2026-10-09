@@ -19,7 +19,7 @@ from ya_voy.whatsapp.client import EvolutionClient
 from ya_voy.worker import jobs
 from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
-from ya_voy.worker.orders import alert_unclaimed_orders
+from ya_voy.worker.orders import alert_unclaimed_orders, retry_parked_reaction
 from ya_voy.worker.outbound import send_outbound
 from ya_voy.worker.reports import process_daily_reports, process_report_corrections
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
@@ -96,8 +96,10 @@ class WorkerSettings:
         process_inbound_event,
         send_outbound,
         evaluate_draft,
+        retry_parked_reaction,
     ]
-    # TODO(later stage): retention (apply_data_retention).
+    # TODO(before production): retention cron apply_data_retention (RNF-10, DC-11);
+    # see docs/plans/pending-before-production.md.
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown
