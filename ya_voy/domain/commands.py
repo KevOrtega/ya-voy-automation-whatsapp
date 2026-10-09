@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -46,4 +47,45 @@ def parse_store_command(text: str | None) -> StoreCommand | None:
         return StoreCommand.HELP
     if _CANCEL_RE.match(normalized):
         return StoreCommand.CANCEL
+    return None
+
+
+class AdminCommand(StrEnum):
+    CONFIRM = "confirm"
+    REJECT = "reject"
+    CANCEL = "cancel"
+    RELEASE = "release"
+    STATUS = "status"
+    HELP = "help"
+
+
+@dataclass(frozen=True)
+class ParsedAdminCommand:
+    command: AdminCommand
+    code: str | None = None  # cancelar / liberar
+
+
+# Doc 07: same confirmation words as the store, without 👍 (store only).
+_ADMIN_CONFIRM = _CONFIRM - {"👍"}
+_ADMIN_STATUS = {"estado", "horario"}
+_ADMIN_CODE_RE = re.compile(r"^(?P<verb>cancelar|liberar)\s+(?P<code>\S+)$")
+
+
+def parse_admin_command(text: str | None) -> ParsedAdminCommand | None:
+    """An admin command (doc 07 "Comandos reconocidos"), or ``None``: then the text is treated
+    as a possible schedule instruction (CU-14)."""
+    if not text:
+        return None
+    normalized = _normalize(text)
+    if normalized in _ADMIN_CONFIRM:
+        return ParsedAdminCommand(AdminCommand.CONFIRM)
+    if normalized in _REJECT:
+        return ParsedAdminCommand(AdminCommand.REJECT)
+    if normalized in _ADMIN_STATUS:
+        return ParsedAdminCommand(AdminCommand.STATUS)
+    if normalized in _HELP:
+        return ParsedAdminCommand(AdminCommand.HELP)
+    if match := _ADMIN_CODE_RE.match(normalized):
+        verb = AdminCommand.CANCEL if match["verb"] == "cancelar" else AdminCommand.RELEASE
+        return ParsedAdminCommand(verb, match["code"].upper())
     return None
