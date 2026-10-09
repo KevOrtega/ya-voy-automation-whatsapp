@@ -101,6 +101,7 @@ class Settings(BaseSettings):
     outbound_min_interval_ms: int = Field(1000, ge=0)
     outbound_max_attempts: int = Field(5, gt=0)
     data_retention_days: int = Field(90, gt=0)
+    data_retention_batch_size: int = Field(500, gt=0)
 
     # Development tooling (docs/plans/real-number-verification.md)
     capture_inbound_payloads: bool = False

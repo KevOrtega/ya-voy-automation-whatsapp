@@ -22,6 +22,7 @@ from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.orders import alert_unclaimed_orders, retry_parked_reaction
 from ya_voy.worker.outbound import send_outbound
 from ya_voy.worker.reports import process_daily_reports, process_report_corrections
+from ya_voy.worker.retention import apply_data_retention
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.sweeps import recover_inbound_events, recover_outbound_messages
 
@@ -41,6 +42,10 @@ def cron_schedule(interval_seconds: int) -> dict[str, Any]:
     return {"minute": set(range(0, 60, minutes)), "second": 0}
 
 
+# apply_data_retention: every hour at minute 17 (docs/06, "Tareas programadas").
+RETENTION_CRON: dict[str, Any] = {"minute": 17, "second": 0, "timeout": 30 * 60}
+
+
 def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
     schedule = cron_schedule(interval_seconds)
     # unique=True (default): one run at a time across workers; timeout well under the interval.
@@ -53,6 +58,9 @@ def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
         cron(remind_still_closed, run_at_startup=True, **schedule),
         cron(process_daily_reports, run_at_startup=True, **schedule),
         cron(process_report_corrections, run_at_startup=True, **schedule),
+        # Hourly, not every interval: idempotent, and after the first run of a day there is
+        # little left to do (RETENTION_CRON); at startup too, so a restart catches up.
+        cron(apply_data_retention, run_at_startup=True, **RETENTION_CRON),
     ]
 
 
@@ -98,8 +106,6 @@ class WorkerSettings:
         evaluate_draft,
         retry_parked_reaction,
     ]
-    # TODO(before production): retention cron apply_data_retention (RNF-10, DC-11);
-    # see docs/plans/pending-before-production.md.
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown

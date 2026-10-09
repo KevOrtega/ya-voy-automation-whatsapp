@@ -16,6 +16,7 @@ from ya_voy.worker.orders import alert_unclaimed_orders, retry_parked_reaction
 from ya_voy.worker.outbound import backoff_delay, send_outbound
 from ya_voy.worker.ratelimit import window_key
 from ya_voy.worker.reports import process_daily_reports, process_report_corrections
+from ya_voy.worker.retention import apply_data_retention
 from ya_voy.worker.routing import Route, is_private, route_event
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.settings import build_cron_jobs, cron_schedule
@@ -66,7 +67,10 @@ def test_worker_registers_stage_3_jobs_and_sweeps() -> None:
         remind_still_closed,
         process_daily_reports,
         process_report_corrections,
+        apply_data_retention,
     }
+    retention = next(j for j in WorkerSettings.cron_jobs if j.coroutine is apply_data_retention)
+    assert (retention.minute, retention.second, retention.run_at_startup) == (17, 0, True)
 
 
 @pytest.mark.parametrize(
@@ -85,7 +89,8 @@ def test_cron_schedule(interval: int, expected: dict) -> None:
 
 def test_build_cron_jobs_uses_the_interval() -> None:
     jobs = build_cron_jobs(30)
-    assert all(job.second == {0, 30} and job.unique for job in jobs)
+    assert all(job.unique for job in jobs)
+    assert all(job.second == {0, 30} for job in jobs if job.coroutine is not apply_data_retention)
 
 
 @pytest.mark.parametrize(
