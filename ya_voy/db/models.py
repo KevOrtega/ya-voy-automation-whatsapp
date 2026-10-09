@@ -253,6 +253,14 @@ class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
         CheckConstraint(sql_in("direction", MessageDirection), name="direction_check"),
+        # The originating webhook event only exists for incoming messages, the outbox row only
+        # for outgoing ones (doc 05 does not make them mandatory).
+        CheckConstraint(
+            "direction = 'in' OR inbound_event_id IS NULL", name="inbound_event_only_in"
+        ),
+        CheckConstraint(
+            "direction = 'out' OR outbound_message_id IS NULL", name="outbound_message_only_out"
+        ),
         Index("messages_chat_jid_created_at_idx", "chat_jid", "created_at"),
         Index("messages_order_id_idx", "order_id"),
         Index("messages_wa_message_id_idx", "wa_message_id"),
@@ -279,6 +287,15 @@ class OutboundMessage(Base):
     __table_args__ = (
         CheckConstraint(sql_in("message_type", OutboundMessageType), name="message_type_check"),
         CheckConstraint(sql_in("status", OutboundStatus), name="status_check"),
+        # delete/edit act on an existing bot message; a document is a report revision's file
+        CheckConstraint(
+            "message_type NOT IN ('delete', 'edit') OR target_wa_message_id IS NOT NULL",
+            name="target_for_delete_edit",
+        ),
+        CheckConstraint(
+            "message_type <> 'document' OR report_revision_id IS NOT NULL",
+            name="revision_for_document",
+        ),
         Index(
             "outbound_messages_retry_idx",
             "status",
@@ -369,8 +386,23 @@ class ScheduleOverride(Base):
         ),
         CheckConstraint(
             "kind NOT IN ('closed_window', 'open_window')"
-            " OR (ends_at IS NOT NULL AND starts_at < ends_at)",
+            " OR (starts_at IS NOT NULL AND ends_at IS NOT NULL AND starts_at < ends_at)",
             name="window",
+        ),
+        # 'applied' only for reopen; 'cancelled' only for closures; reopen is never 'active'
+        CheckConstraint(
+            "CASE kind"
+            " WHEN 'reopen' THEN status NOT IN ('active', 'cancelled')"
+            " WHEN 'open_window' THEN status NOT IN ('applied', 'cancelled')"
+            " ELSE status <> 'applied'"
+            " END",
+            name="status_by_kind",
+        ),
+        # Affected business day: set for closed_today/closed_window/open_window, NULL otherwise
+        CheckConstraint(
+            "(business_date IS NOT NULL)"
+            " = (kind IN ('closed_today', 'closed_window', 'open_window'))",
+            name="business_date_by_kind",
         ),
         # At most one pending confirmation per admin (RN-24)
         Index(
