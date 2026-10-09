@@ -55,7 +55,7 @@ flowchart TB
 | Contenedor | Tecnología | Responsabilidad | No hace |
 |------------|-----------|-----------------|---------|
 | `web` | FastAPI + Uvicorn, SQLAlchemy 2 (async) + asyncpg | Validar el secreto del webhook, descartar lo obviamente irrelevante (ver reglas de descarte abajo), insertar en `inbound_events` sin los campos secretos del sobre (`destination`, `apikey`), encolar, responder rápido. `/health`. | Llamar al LLM o a Evolution. No expone API de administración. |
-| `worker` | arq, openpyxl | `process_inbound_event`, `evaluate_draft`, `send_outbound`; tareas cron: vencimiento de borradores y confirmaciones de pedido, alerta de pedidos sin tomar, vencimiento de confirmaciones de horario, recordatorio de cierre vigente, reporte diario y correcciones (con espera de pendientes), retención y barridos de recuperación. | Exponer HTTP. |
+| `worker` | arq, openpyxl | `process_inbound_event`, `evaluate_draft`, `send_outbound`, `retry_parked_reaction`; tareas cron: vencimiento de borradores y confirmaciones de pedido, alerta de pedidos sin tomar, vencimiento de confirmaciones de horario, recordatorio de cierre vigente, reporte diario y correcciones (con espera de pendientes), retención y barridos de recuperación. | Exponer HTTP. |
 | `postgres` | PostgreSQL 16 | Fuente de verdad. Dos bases: `yavoy` (aplicación) y `evolution` (interna de Evolution). | — |
 | `redis` | Redis 7 | Cola de arq, lock por local, lock del límite de envío, contadores de límite por remitente, caché de Evolution (con prefijo propio). | Guardar estado de negocio. |
 | `evolution` | Evolution API v2 | Mantener la sesión de WhatsApp (QR), entregar eventos por webhook, enviar textos y documentos, eliminar y editar mensajes propios. | Lógica de negocio. |
@@ -76,7 +76,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` con más de `OUTBOUND_RECOVERY_SECONDS` | Reencolar |
-| `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` |
+| `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` (**pendiente, todavía no implementada**: ver `docs/plans/pending-before-production.md`) |
 
 ### Componentes internos (paquete `ya_voy`, propuesta)
 
@@ -233,11 +233,34 @@ seguir encuentra `cancelled` (T19: `courier_order_no_longer_available`, una vez 
 
 **`group_message_id`.** Se guarda cuando Evolution acepta la publicación (gancho
 `publication.on_group_message_sent`, dentro de la transacción de `send_outbound`, con la fila del pedido
-bloqueada); ahí también se reinicia `unclaimed_alert_at` (CU-03 4a). Hasta entonces ninguna reacción puede
-apuntar al pedido. Si el mensaje del grupo se envía después de que el pedido se canceló (estaba en la bandeja
+bloqueada); ahí también se reinicia `unclaimed_alert_at` (CU-03 4a). Si el mensaje del grupo se envía después de que el pedido se canceló (estaba en la bandeja
 cuando se canceló), el mismo gancho encola su eliminación. Al eliminarse la publicación se guarda
 `group_post_deleted_at` y el evento `group_post_deleted`; si la eliminación falla del todo, el evento
 `group_post_delete_failed` y la alerta genérica `admin_outbound_failed`.
+
+**Reacciones antes de que se guarde `group_message_id` (D-19, docs/04 §2b).** Entre la respuesta de
+Evolution a la publicación y el commit de `send_outbound` hay una ventana: un motero rápido puede reaccionar
+y su evento procesarse antes de que el id exista en la base. Esa reacción (o quita de reacción) no se
+descarta (`ya_voy/orders/parking.py`):
+
+1. Toda reacción toma primero `pg_advisory_xact_lock(5005, hashtext(id del mensaje))` y busca el pedido por
+   `group_message_id`. Si no lo encuentra y el id es de un mensaje del bot que no es una publicación (ya
+   tiene `wa_message_id` en la bandeja), se ignora (RN-12). Si no, se **estaciona** en `parked_reactions`
+   (con `reacted_at` = `messageTimestamp`) y, después del commit, se encola `retry_parked_reaction`
+   diferido.
+2. El gancho, al guardar `group_message_id`, toma el mismo lock (antes de la fila del pedido) y, en la misma
+   transacción, aplica primero las estacionadas para ese id, ordenadas por `reacted_at`, luego
+   `inbound_event_id` (orden de llegada) y luego orden de estacionamiento. Desde el commit, la guarda
+   atómica de siempre decide: una reacción procesada después ya no puede adelantarse a una anterior
+   estacionada. El lock cierra la ventana entre "no hay pedido con este id" y "quedó estacionada".
+3. Reintentos acotados (`parking.RETRY_DELAYS`, constante): 3 reintentos a 1 s, 2 s y 2 s (~5 s en total).
+   Un reintento que encuentra la fila ya aplicada no hace nada; si encuentra el pedido, aplica las
+   estacionadas; si después del último sigue sin pedido, la descarta (`discarded`) con un `WARNING` en el
+   log. Un evento reentregado (`inbound_event_id` repetido) no se estaciona dos veces ni abre otra cadena
+   de reintentos; ya aplicado, es `duplicate` (ver "Eventos repetidos").
+
+Orden de locks: lock de asesoramiento del mensaje, luego fila del pedido, luego fila del reporte. La
+cancelación no toma el lock de asesoramiento (no hace falta: solo bloquea la fila del pedido).
 
 **Cancelación.** Se eliminan la publicación y todas las respuestas del bot sobre el pedido en el grupo que ya
 tienen id de WhatsApp (T16 y T17, RN-20).
@@ -259,7 +282,9 @@ ignora (`duplicate`): una quita de reacción reentregada después de una nueva t
 
 Pendiente para la etapa 5b (`TODO(stage-5b)`): convertir los payloads de Evolution (reacción, quita, cambio de
 emoji) en estos eventos con el número de prueba, dar de alta o fusionar al motero por número o `@lid`
-(docs/05) y llamar a `orders.apply_reaction` en la transacción del evento entrante
+(docs/05), pasar `messageTimestamp` como `reacted_at`, descartar antes las reacciones a mensajes que no son
+del bot (`reactionMessage.key.fromMe` falso, para no estacionarlas) y llamar a `orders.apply_reaction` en la
+transacción del evento entrante (encolando después del commit `enqueue_parked_retry`)
 (`worker/inbound.py`); confirmar que Evolution entrega mensajes privados a un `@lid`
 (`notify.courier_jid`). Pendiente para la etapa 6b (`TODO(stage-6b)`): verificar la eliminación y la edición
 con el número de prueba y, si la eliminación falla, editar (`group_order_cancelled_edit`) y luego responder
@@ -435,6 +460,14 @@ administrador por número o `@lid` para comandos sobre el reporte (`estado` con 
 reenvío por WhatsApp); conectar T13, T16, T17 y T18 (etapas de liberación y cancelación) con
 `mark_report_for_correction`; probar el envío real del documento con Evolution.
 
+#### Retención de datos (pendiente antes de producción)
+
+RNF-10 / DC-11 (docs/01): a los `DATA_RETENTION_DAYS` (90) días se anonimizan direcciones, notas, textos
+de mensajes, payloads crudos y archivos de reportes, conservando códigos, estados, tiempos y conteos. La
+tarea `apply_data_retention` y su registro en el worker **todavía no existen** (`TODO(later stage)` en
+`ya_voy/worker/settings.py`); es requisito antes de producción. Detalle y criterios de aceptación en
+`docs/plans/pending-before-production.md`.
+
 #### Política de reintentos de la bandeja de salida
 
 `send_outbound` distingue errores transitorios y permanentes de Evolution:
@@ -470,7 +503,7 @@ administrador, salvo que el mensaje fallido sea esa misma alerta. El backoff vig
 | D-16 | Día operativo (`business_date`) con corte a `BUSINESS_DAY_ROLLOVER_TIME` | Las aperturas después de medianoche siguen perteneciendo al día que las originó, también en el reporte. |
 | D-17 | Reporte versionado (`report_revisions`) con correcciones por diferencia neta | Los cambios posteriores al envío se informan sin reescribir lo enviado ni mandar correcciones vacías. |
 | D-18 | Claves de idempotencia de las transiciones con el id del `order_event` | Liberar y volver a tomar avisa de nuevo; un reintento de la misma transición no puede duplicar mensajes. |
-| D-19 | `group_message_id` se guarda cuando Evolution acepta la publicación | Solo se puede reaccionar a un mensaje que existe; el gancho serializa con la cancelación y elimina publicaciones tardías. |
+| D-19 | `group_message_id` se guarda cuando Evolution acepta la publicación; las reacciones que llegan antes se estacionan y el gancho las aplica primero, en orden de `messageTimestamp` | Solo se puede reaccionar a un mensaje que existe, pero la primera reacción gana aunque llegue antes del commit del id; el gancho serializa con la cancelación y elimina publicaciones tardías. |
 
 ## 3. Entorno de desarrollo (Docker Compose)
 

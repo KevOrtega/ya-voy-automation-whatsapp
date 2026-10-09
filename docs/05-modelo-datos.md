@@ -44,6 +44,8 @@ erDiagram
     schedule_overrides |o--o{ schedule_overrides : "cancels"
     schedule_overrides |o--o{ daily_reports : "reopens"
     inbound_events |o--o{ schedule_overrides : "requested by"
+    couriers ||--o{ parked_reactions : "reacted"
+    inbound_events |o--o| parked_reactions : "parked as"
 
     stores {
         bigint id PK
@@ -221,6 +223,20 @@ erDiagram
         bigint cancelled_by_override_id FK
         timestamptz created_at
     }
+
+    parked_reactions {
+        bigint id PK
+        text group_message_id "target wa id"
+        text kind
+        bigint courier_id FK
+        text emoji "nullable"
+        bigint inbound_event_id FK,UK "nullable"
+        timestamptz reacted_at
+        text status
+        int attempts
+        timestamptz created_at
+        timestamptz resolved_at
+    }
 ```
 
 ## Tablas
@@ -389,6 +405,30 @@ Un motero aparece en el resumen si tiene al menos un valor distinto de cero.
 
 `payload` se guarda sin los campos del sobre que llevan secretos: `destination` (la URL del webhook,
 con `WEBHOOK_SECRET`) y `apikey` se reemplazan por `***`.
+
+### `parked_reactions` (reacciones a la espera de su publicación)
+
+Una reacción cuyo mensaje objetivo todavía no es el `group_message_id` de ningún pedido (Evolution ya
+aceptó la publicación pero `send_outbound` no guardó el id) queda acá, buscable por ese id. Ver docs/06,
+D-19.
+
+| Columna | Tipo | Restricciones | Notas |
+|---------|------|---------------|-------|
+| `id` | `bigint` | PK, identity | |
+| `group_message_id` | `text` | `NOT NULL` | `reactionMessage.key.id`: el mensaje al que se reaccionó. |
+| `kind` | `text` | `NOT NULL`, `CHECK (kind IN ('added','removed'))` | |
+| `courier_id` | `bigint` | FK → `couriers.id`, `NOT NULL` | |
+| `emoji` | `text` | nullable; `CHECK (kind = 'removed' OR emoji IS NOT NULL)` | |
+| `inbound_event_id` | `bigint` | FK → `inbound_events.id`, nullable, `UNIQUE` | Un evento reentregado no se estaciona dos veces. |
+| `reacted_at` | `timestamptz` | `NOT NULL` | `messageTimestamp` de la reacción; ordena la aplicación. |
+| `status` | `text` | `NOT NULL DEFAULT 'pending'`, `CHECK (status IN ('pending','applied','discarded'))` | |
+| `attempts` | `int` | `NOT NULL DEFAULT 0` | Reintentos diferidos que no encontraron el pedido. |
+| `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
+| `resolved_at` | `timestamptz` | nullable | Cuando se aplicó o descartó. |
+
+Índice: `parked_reactions_pending_target_idx (group_message_id, reacted_at) WHERE status = 'pending'`.
+Retención (RNF-10): las filas resueltas no tienen datos personales más allá del `courier_id`; se
+borran o anonimizan junto con lo demás (pendiente, ver `docs/plans/pending-before-production.md`).
 
 ### `messages` (historial de conversación)
 

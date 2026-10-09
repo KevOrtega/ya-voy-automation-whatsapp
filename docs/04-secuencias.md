@@ -104,7 +104,12 @@ sequenceDiagram
         end
         W->>EVO: sendText al grupo de moteros
         EVO-->>W: key.id del mensaje publicado
-        W->>DB: UPDATE orders SET group_message_id = key.id
+        rect rgb(235, 245, 255)
+            Note over W,DB: Una transacción (la de send_outbound)
+            W->>DB: pg_advisory_xact_lock(key.id), luego SELECT orders ... FOR UPDATE
+            W->>DB: UPDATE orders SET group_message_id = key.id, unclaimed_alert_at
+            W->>DB: aplicar las reacciones estacionadas para key.id (orden: messageTimestamp, inbound_event_id)
+        end
         W->>EVO: sendText al local
         EVO->>S: "Pedido YV-0042 enviado a los moteros"
     else fuera del horario efectivo
@@ -122,6 +127,8 @@ Puntos clave:
 - El intervalo de agrupación (`DRAFT_DEBOUNCE_SECONDS`) evita responder "faltan datos" a cada mensaje de una ráfaga.
 - `group_message_id` se guarda cuando Evolution devuelve el `key.id`; sin ese id no se pueden asociar las
   reacciones, por eso la publicación en el grupo se envía antes que la confirmación al local.
+- Una reacción que llega entre la respuesta de Evolution y el commit de ese id no se descarta: se
+  estaciona (`parked_reactions`) y se aplica primero en esa misma transacción (sección 2b).
 
 ## 2. Toma con carrera entre dos moteros y alta automática
 
@@ -178,6 +185,50 @@ sequenceDiagram
     W2->>EVO: privado a B: courier_order_already_taken
     EVO->>B: "El pedido YV-0042 ya lo tomó otro motero"
 ```
+
+## 2b. Reacción antes de que se guarde `group_message_id`
+
+Caso: Emiliano reacciona apenas ve la publicación; su evento se procesa antes de que `send_outbound`
+haga commit del `key.id`. Joel reacciona después, cuando el id ya está guardado.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Emiliano
+    actor B as Joel
+    participant EVO as Evolution API
+    participant WS as Worker (send_outbound)
+    participant WR as Worker (reacciones)
+    participant DB as PostgreSQL
+
+    WS->>EVO: sendText al grupo (group_order_post)
+    EVO-->>WS: key.id = P
+    A->>EVO: reacciona 👍 a P (messageTimestamp t1)
+    EVO->>WR: reacción de A a P
+    rect rgb(255, 245, 235)
+        Note over WR,DB: Transacción de la reacción de A
+        WR->>DB: pg_advisory_xact_lock(P)
+        WR->>DB: SELECT orders WHERE group_message_id = P → ninguno (aún sin commit)
+        WR->>DB: INSERT parked_reactions (P, A, t1, pending)
+    end
+    WR->>WR: encola retry_parked_reaction diferido 1 s
+    rect rgb(235, 245, 255)
+        Note over WS,DB: Transacción de send_outbound
+        WS->>DB: pg_advisory_xact_lock(P), SELECT orders FOR UPDATE
+        WS->>DB: UPDATE orders SET group_message_id = P
+        WS->>DB: aplica las estacionadas de P: UPDATE ... WHERE courier_id IS NULL → gana A
+    end
+    B->>EVO: reacciona 🏍️ a P (t2 > t1)
+    EVO->>WR: reacción de B a P
+    WR->>DB: pg_advisory_xact_lock(P), encuentra el pedido, UPDATE ... → 0 filas (T11)
+    WR->>WR: retry_parked_reaction de A: ya aplicada, no hace nada
+```
+
+- El lock de asesoramiento (por transacción, sobre el id del mensaje) cierra la ventana entre "ningún
+  pedido tiene este id" y "la reacción quedó estacionada": o la reacción ve el id ya confirmado, o queda
+  estacionada antes de que el gancho busque las estacionadas.
+- Si el id nunca aparece (la reacción era a otro mensaje), los reintentos (1 s, 2 s, 2 s) la descartan
+  y lo registran en el log. Un mensaje del bot que no es publicación y ya tiene id se ignora en el acto.
 
 ## 3. Liberación, quitar reacción de un no asignado y cambio de emoji
 
