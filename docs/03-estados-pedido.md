@@ -173,6 +173,11 @@ UPDATE daily_reports
 Si el reporte del día todavía no se generó (`waiting` o sin fila), no hace falta nada: `report_due_at(D)` ya
 incluye la apertura.
 
+Un reporte `failed` no se marca (los crons no lo tocan). Solo sale de `failed` con el reenvío manual
+(`make resend-report`, docs/06 "Reenvío manual de reportes fallidos"): pasa a `generating` si la última
+versión tiene archivo (y, enviada, a `correction_pending` para comparar con los cambios ocurridos mientras
+estuvo `failed`), o a `waiting` / `correction_pending` para rearmarla si no lo tiene.
+
 ## 2. Cambio de horario (`schedule_overrides`)
 
 ### Estados

@@ -72,7 +72,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `alert_unclaimed_orders` | `published`, sin alerta, `unclaimed_alert_at < now()` | T15 |
 | `expire_schedule_confirmations` | `schedule_overrides` en `pending_confirmation` con `confirmation_expires_at < now()` | Pasan a `expired` |
 | `remind_still_closed` | Hora local ≥ `BUSINESS_HOURS_START`, hay un `closed_until_further_notice` activo y no se avisó hoy | `admin_schedule_still_closed` |
-| `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`generating` (las revisiones fallidas se reintentan hasta `DAILY_REPORT_MAX_ATTEMPTS`; un reporte `failed` es terminal) | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
+| `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`generating` (las revisiones fallidas se reintentan hasta `DAILY_REPORT_MAX_ATTEMPTS`; un reporte `failed` es terminal: sale con `make resend-report`) | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
 | `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` con más de `OUTBOUND_RECOVERY_SECONDS` | Reencolar |
@@ -311,11 +311,17 @@ Reglas:
 
 - Una revisión en `generating` cuenta como en curso durante 10 minutos desde `last_checked_at`; después se
   reintenta con el mismo número. Los fallos de armado se reintentan hasta `DAILY_REPORT_MAX_ATTEMPTS`; al
-  agotarse, la revisión y el reporte quedan `failed` (terminal) y sale `admin_daily_report_failed` (clave
-  `admin_daily_report_failed:{D}:v{N}`) con un texto genérico; el error técnico queda en `last_error`.
-- El reporte pasa a `sent` cuando se enviaron todas las copias. Si una copia falla definitivamente, la
-  revisión y el reporte quedan `failed` y la alerta es `admin_daily_report_failed` (en lugar de
-  `admin_outbound_failed`).
+  agotarse, la revisión y el reporte quedan `failed` (terminal para los crons) y sale
+  `admin_daily_report_failed` (clave `admin_daily_report_failed:{D}:v{N}`, más `:r{K}` tras un reenvío
+  manual) con un texto genérico; el error técnico queda en `last_error`. Cada intento fallido se registra en
+  `WARNING` y el fallo definitivo en `ERROR`.
+- El reporte pasa a `sent` cuando nada de la revisión queda en la bandeja de salida y cada destinatario
+  recibió una copia (en cualquier ronda). Si una copia falla definitivamente, la revisión y el reporte quedan
+  `failed` y la alerta es `admin_daily_report_failed` (en lugar de `admin_outbound_failed`).
+- Todo fallo definitivo del reporte (armado o envío) se registra en el log a nivel `ERROR`, con fecha,
+  versión, destinatario (en el envío) y error, por ejemplo `daily report 2026-10-09 v1 FAILED: delivery to
+  un administrador failed after 5 attempts: ...` (campos `report_date`, `revision`, `recipient`, `error`,
+  `outbound_message_id`). Así se ve aunque WhatsApp esté caído y la alerta tampoco llegue.
 - Corrección sin diferencia neta (p. ej. se liberó y lo volvió a tomar el mismo motero): no se genera
   versión; el reporte vuelve a `sent`. Si había una versión sin enviar que se reintentaba, queda `failed`
   ("superseded: no net changes").
@@ -326,10 +332,44 @@ Reglas:
 - La nota de cambios de horario va solo en la versión 1.
 - El archivo muestra nombres de moteros y horas de Buenos Aires (`dd/mm/aaaa hh:mm`).
 
-Pendiente para la etapa 8b (`TODO(stage-8b)`): reconocer al administrador por número o `@lid` para comandos
-sobre el reporte (`estado` con el estado del reporte, reintento manual de un reporte `failed`); conectar
-T13, T16, T17 y T18 (etapas de liberación y cancelación) con `mark_report_for_correction`; probar el envío
-real del documento con Evolution.
+##### Reenvío manual de reportes fallidos
+
+Si WhatsApp estuvo desconectado (p. ej. toda la noche), la bandeja de salida agota los intentos, el reporte
+queda `failed` y la alerta al administrador tampoco sale. Después de corregir la causa:
+
+```bash
+make resend-report date=2026-10-09      # ese día (se pueden pasar varias fechas)
+make resend-report date=--all-failed    # todos los reportes en failed
+```
+
+(`python -m scripts.resend_report` dentro del `worker`; `reports.service.resend_failed_reports`). Por cada
+día, en una transacción corta que bloquea el reporte con `FOR UPDATE` (esperando, no saltando):
+
+- Si el reporte no está `failed` (no existe, ya se reenvió, se envió, está en curso), no hace nada
+  (`not_found` / `not_failed`). Así, correrlo dos veces, o dos a la vez, reenvía una sola vez: la segunda
+  corrida espera el lock y encuentra el reporte ya fuera de `failed`.
+- **La última versión sin enviar tiene archivo** (falló el envío): la revisión vuelve a `generated`,
+  `resends + 1`, el reporte pasa a `generating` y se encola un documento por administrador que todavía no lo
+  recibió (ni lo tiene en la bandeja), con clave nueva `daily_report:{D}:v{N}:r{K}:{teléfono}` (K =
+  `resends`), así nunca choca con una copia anterior (`resent`). Cuando todas llegan, la revisión queda
+  `sent` y el reporte pasa a `correction_pending` (no a `sent`): mientras estuvo `failed`, los cambios de
+  pedidos no lo marcaron, así que el cron de correcciones compara una vez más (sin cambios → `sent`).
+- **Sin archivo** (falló el armado, o la retención lo borró): `attempts` vuelve a 0 y el reporte pasa a
+  `waiting` (si nunca se envió una versión) o a `correction_pending`; el comando corre enseguida el paso del
+  día, que arma la versión con los datos actuales y la encola (`rebuild:started`; si hay pendientes,
+  `rebuild:waiting` y sigue el cron). Las claves llevan el mismo `:r{K}`.
+- Si el reenvío vuelve a fallar, el reporte queda `failed` otra vez, con log `ERROR` y alerta
+  `admin_daily_report_failed:{D}:v{N}:r{K}`; se puede volver a reenviar (ronda K + 1).
+
+Transiciones: reporte `failed` → `generating` (con archivo) o `waiting` / `correction_pending` (sin archivo);
+revisión `failed` → `generated` (con archivo) o queda `failed` con `attempts = 0` hasta que el paso la pasa
+a `generating`.
+
+Pendiente para la etapa 8b (`TODO(stage-8b)`): reenviar automáticamente los reportes `failed` cuando un
+`CONNECTION_UPDATE` indique que la conexión volvió (`state = open`), sin esperar al operador; reconocer al
+administrador por número o `@lid` para comandos sobre el reporte (`estado` con el estado del reporte, el
+reenvío por WhatsApp); conectar T13, T16, T17 y T18 (etapas de liberación y cancelación) con
+`mark_report_for_correction`; probar el envío real del documento con Evolution.
 
 #### Política de reintentos de la bandeja de salida
 

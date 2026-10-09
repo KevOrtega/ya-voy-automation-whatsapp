@@ -195,6 +195,7 @@ erDiagram
         text file_name
         bytea file_content
         int attempts
+        int resends
         text last_error
         timestamptz generated_at
         timestamptz sent_at
@@ -465,7 +466,7 @@ correcciones (RN-22, RN-23).
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
 | `report_date` | `date` | `NOT NULL`, `UNIQUE` | Día operativo (`business_date`) que cubre el reporte. |
-| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','sent','correction_pending','failed'))` | `waiting`: hay pendientes antes del primer envío. `correction_pending`: hubo cambios después de un envío o el día se extendió con una apertura extra. |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','sent','correction_pending','failed'))` | `waiting`: hay pendientes antes del primer envío. `correction_pending`: hubo cambios después de un envío o el día se extendió con una apertura extra. `failed`: se agotaron los intentos de armado o falló el envío de una copia; terminal para los crons, sale con el reenvío manual (docs/06). |
 | `due_at` | `timestamptz` | `NOT NULL` | Cierre efectivo del día (`report_due_at(D)`); se recalcula mientras está `waiting` y cuando una apertura extra reabre el reporte. Ninguna versión se envía antes de `due_at`. |
 | `current_revision` | `int` | `NOT NULL DEFAULT 0` | Última versión enviada (0 = ninguna). |
 | `pending_orders_count` | `int` | `NOT NULL DEFAULT 0` | Última cuenta de pendientes. |
@@ -490,7 +491,8 @@ Cada versión del reporte. La revisión 1 es el original; las siguientes son cor
 | `changes` | `jsonb` | `NOT NULL DEFAULT '[]'` | Cambios respecto de la revisión anterior: `[{"code": "YV-0123", "type": "courier_changed", "from": "Joel", "to": "Emiliano"}]`. Tipos: `added`, `courier_changed`, `cancelled`. |
 | `file_name` | `text` | nullable | `reporte-ya-voy-2026-10-09.xlsx`, `reporte-ya-voy-2026-10-09-correccion-2.xlsx`. |
 | `file_content` | `bytea` | nullable | El archivo (decenas de KB). Se borra por retención. |
-| `attempts` | `int` | `NOT NULL DEFAULT 0` | |
+| `attempts` | `int` | `NOT NULL DEFAULT 0` | Intentos de armado; el reenvío manual sin archivo lo vuelve a 0. |
+| `resends` | `int` | `NOT NULL DEFAULT 0` | Reenvíos manuales (`make resend-report`). Si es K > 0, las claves de los documentos son `daily_report:{D}:v{N}:r{K}:{teléfono}`. |
 | `last_error` | `text` | nullable | |
 | `generated_at`, `sent_at` | `timestamptz` | nullable | |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
