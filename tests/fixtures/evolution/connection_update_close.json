@@ -1,0 +1,16 @@
+{
+  "event": "connection.update",
+  "instance": "yavoy",
+  "data": {
+    "instance": "yavoy",
+    "state": "close",
+    "statusReason": 401,
+    "wuid": "5491100009999@s.whatsapp.net",
+    "profileName": "Ya Voy Test"
+  },
+  "destination": "http://web:8000/webhooks/evolution/***",
+  "date_time": "2026-10-09T15:00:00.000Z",
+  "sender": "5491100009999@s.whatsapp.net",
+  "server_url": "http://localhost:8080",
+  "apikey": null
+}

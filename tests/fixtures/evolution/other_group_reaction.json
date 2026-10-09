@@ -1,0 +1,33 @@
+{
+  "event": "messages.upsert",
+  "instance": "yavoy",
+  "data": {
+    "key": {
+      "remoteJid": "120363000000000999@g.us",
+      "fromMe": false,
+      "id": "3EB0A1B2C3D4E5F60011",
+      "participant": "200000000000001@lid"
+    },
+    "pushName": "Joel Moto",
+    "status": "DELIVERY_ACK",
+    "message": {
+      "reactionMessage": {
+        "key": {
+          "remoteJid": "120363000000000999@g.us",
+          "fromMe": false,
+          "id": "3EB0FFFF"
+        },
+        "text": "😂"
+      }
+    },
+    "messageType": "reactionMessage",
+    "messageTimestamp": 1791561600,
+    "instanceId": "00000000-0000-0000-0000-000000000001",
+    "source": "android"
+  },
+  "destination": "http://web:8000/webhooks/evolution/***",
+  "date_time": "2026-10-09T15:00:00.000Z",
+  "sender": "5491100009999@s.whatsapp.net",
+  "server_url": "http://localhost:8080",
+  "apikey": null
+}

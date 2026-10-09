@@ -1,0 +1,13 @@
+{
+  "event": "presence.update",
+  "instance": "yavoy",
+  "data": {
+    "id": "5491155550001@s.whatsapp.net",
+    "presences": {}
+  },
+  "destination": "http://web:8000/webhooks/evolution/***",
+  "date_time": "2026-10-09T15:00:00.000Z",
+  "sender": "5491100009999@s.whatsapp.net",
+  "server_url": "http://localhost:8080",
+  "apikey": null
+}

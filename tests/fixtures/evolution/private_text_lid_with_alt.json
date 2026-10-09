@@ -1,0 +1,27 @@
+{
+  "event": "messages.upsert",
+  "instance": "yavoy",
+  "data": {
+    "key": {
+      "remoteJid": "5491155550002@s.whatsapp.net",
+      "remoteJidAlt": "5491155550002@s.whatsapp.net",
+      "fromMe": false,
+      "id": "3EB0A1B2C3D4E5F60002",
+      "addressingMode": "lid"
+    },
+    "pushName": "Kiosco Test",
+    "status": "DELIVERY_ACK",
+    "message": {
+      "conversation": "hola"
+    },
+    "messageType": "conversation",
+    "messageTimestamp": 1791561600,
+    "instanceId": "00000000-0000-0000-0000-000000000001",
+    "source": "android"
+  },
+  "destination": "http://web:8000/webhooks/evolution/***",
+  "date_time": "2026-10-09T15:00:00.000Z",
+  "sender": "5491100009999@s.whatsapp.net",
+  "server_url": "http://localhost:8080",
+  "apikey": null
+}
