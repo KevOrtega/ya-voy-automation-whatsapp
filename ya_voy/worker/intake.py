@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,8 +43,9 @@ from ya_voy.domain.orders import OrderFields, clean_extraction, merge, validate_
 from ya_voy.llm.extractor import LLMError, OrderExtractor
 from ya_voy.llm.schemas import OrderExtraction
 from ya_voy.locks import store_lock
-from ya_voy.messaging import catalog
+from ya_voy.messaging import catalog, order_texts
 from ya_voy.messaging.outbox import enqueue_admin_alert
+from ya_voy.orders import store_commands
 from ya_voy.schedule.calendar import business_date
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,15 @@ def _event(
         inbound_event_id=inbound_event_id,
         data=data or {},
     )
+
+
+def _request_key(msg: StoreText) -> str:
+    """Names the store message in outbox keys (one reply per message)."""
+    if msg.inbound_event_id is not None:
+        return f"inbound:{msg.inbound_event_id}"
+    if msg.wa_message_id is not None:
+        return f"msg:{msg.wa_message_id}"
+    return f"local:{uuid.uuid4()}"  # direct calls without a WhatsApp message (tests, scripts)
 
 
 async def _llm_failed(
@@ -314,14 +325,28 @@ async def handle_store_text(
     async with store_lock(redis, settings, msg.store_id) as lock:
         command = parse_store_command(msg.text)
         if command is not None:
-            # TODO(stage-4b): CONFIRM -> T06/T07, REJECT/CANCEL -> T08 (or CU-09 for published
-            # orders), HELP -> store_help. Commands never reach the LLM (CU-01 5a).
+            # Commands never reach the LLM (CU-01 5a); their effects are stage 5a/6a.
             async with session_factory() as session, session.begin():
                 store = await _get_store(session, msg.store_id)
-                _record_message(session, store, msg, None)
+                result = await store_commands.handle_store_command(
+                    session,
+                    settings,
+                    store,
+                    command,
+                    text=msg.text,
+                    quoted_wa_message_id=msg.quoted_wa_message_id,
+                    request_key=_request_key(msg),
+                    inbound_event_id=msg.inbound_event_id,
+                )
+                _record_message(session, store, msg, result.order_id)
                 if finalize is not None:
                     await finalize(session)
-            return IntakeResult("command", command=command)
+            return IntakeResult(
+                result.outcome,
+                order_id=result.order_id,
+                outbound_ids=result.outbound_ids,
+                command=command,
+            )
 
         for attempt in range(1, MAX_APPLY_ATTEMPTS + 1):
             snapshot = await _read_snapshot(session_factory, settings, msg.store_id)
@@ -471,16 +496,7 @@ async def evaluate_draft(
 
 def render_confirmation_summary(order: Order, store: Store) -> str:
     """``store_order_confirm_request`` with the ``{order_details}`` block (doc 07)."""
-    details = catalog.order_details(
-        store_name=store.display_name,
-        pickup_address=order.pickup_address,
-        delivery_address=order.delivery_address,
-        product=order.product,
-        payment_method=order.payment_method,
-        payment_method_raw=order.payment_method_raw,
-        notes=order.notes,
-    )
-    return catalog.render(catalog.STORE_ORDER_CONFIRM_REQUEST, order_details=details)
+    return order_texts.confirm_request(order, store)
 
 
 async def expire_drafts(session: AsyncSession, settings: Settings) -> list[int]:

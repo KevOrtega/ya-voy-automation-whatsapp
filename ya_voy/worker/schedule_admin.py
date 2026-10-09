@@ -459,8 +459,9 @@ async def handle_admin_text(
                         "help", None, await _reply(session, msg, catalog.ADMIN_HELP)
                     )
                 else:
-                    # TODO(stage-7b): estado/horario (CU-15, admin_schedule_status), cancelar and
-                    # liberar {código} (CU-13, needs stage 6 cancellations).
+                    # TODO(stage-7b): estado/horario (CU-15, admin_schedule_status); cancelar and
+                    # liberar {código} (CU-13) -> orders.cancellation.cancel_by_admin and
+                    # orders.claims.release_by_admin (stage 5a/6a core) in this transaction.
                     result = AdminResult(f"command:{parsed.command}")
                 if finalize is not None:
                     await finalize(session)

@@ -19,6 +19,7 @@ from ya_voy.whatsapp.client import EvolutionClient
 from ya_voy.worker import jobs
 from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
+from ya_voy.worker.orders import alert_unclaimed_orders
 from ya_voy.worker.outbound import send_outbound
 from ya_voy.worker.reports import process_daily_reports, process_report_corrections
 from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
@@ -47,6 +48,7 @@ def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
         cron(recover_inbound_events, run_at_startup=True, **schedule),
         cron(recover_outbound_messages, run_at_startup=True, **schedule),
         cron(expire_drafts, run_at_startup=True, **schedule),
+        cron(alert_unclaimed_orders, run_at_startup=True, **schedule),
         cron(expire_schedule_confirmations, run_at_startup=True, **schedule),
         cron(remind_still_closed, run_at_startup=True, **schedule),
         cron(process_daily_reports, run_at_startup=True, **schedule),
@@ -95,7 +97,7 @@ class WorkerSettings:
         send_outbound,
         evaluate_draft,
     ]
-    # TODO(stage 5+): unclaimed alert, retention.
+    # TODO(later stage): retention (apply_data_retention).
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown

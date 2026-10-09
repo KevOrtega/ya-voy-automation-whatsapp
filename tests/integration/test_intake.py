@@ -252,13 +252,19 @@ async def test_small_talk_without_a_draft_creates_nothing(ctx: dict[str, Any]) -
 
 
 @pytest.mark.parametrize(
-    ("text", "command"),
-    [("sí", StoreCommand.CONFIRM), ("no", StoreCommand.REJECT), ("ayuda", StoreCommand.HELP)],
+    ("text", "command", "outcome"),
+    [
+        ("sí", StoreCommand.CONFIRM, "ignored:nothing_to_confirm"),
+        ("no", StoreCommand.REJECT, "ignored:nothing_to_reject"),
+        ("ayuda", StoreCommand.HELP, "command"),
+    ],
 )
-async def test_commands_skip_the_llm(ctx: dict[str, Any], text: str, command: StoreCommand) -> None:
+async def test_commands_skip_the_llm(
+    ctx: dict[str, Any], text: str, command: StoreCommand, outcome: str
+) -> None:
     store = await new_store(ctx["session_factory"])
     result = await send(ctx, store, text)
-    assert (result.outcome, result.command, result.evaluate) == ("command", command, False)
+    assert (result.outcome, result.command, result.evaluate) == (outcome, command, False)
     assert ctx["order_extractor"].calls == []
     assert await store_orders(ctx["session_factory"], store) == []
 

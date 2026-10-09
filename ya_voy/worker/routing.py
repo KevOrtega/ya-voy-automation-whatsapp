@@ -31,7 +31,7 @@ def route_event(event: ParsedEvent, *, couriers_group_jid: str) -> Route:
     if jids.is_group(event.remote_jid):
         if event.remote_jid != couriers_group_jid or not event.is_reaction:
             return Route.UNHANDLED
-        # TODO(stage 5): claim / release on the order post (reaction_target_id), @lid identity.
+        # TODO(stage-5b): the core is ya_voy.orders (stage 5a); see worker/inbound.py.
         return Route.GROUP_REACTION_REMOVAL if event.is_reaction_removal else Route.GROUP_REACTION
     if jids.is_broadcast(event.remote_jid) or not event.remote_jid:
         return Route.UNHANDLED

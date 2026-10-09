@@ -85,7 +85,15 @@ async def _process_locked(
         # then drafts.after_commit(ctx, result). PRIVATE_NON_TEXT -> store_unsupported_media.
         # Before intake, the RN-18 gate: schedule.repository.is_accepting_orders(); when closed,
         # reply messaging.schedule_texts.store_closed_reply() at most once per
-        # OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES (CU-10). Group reactions are stage 5.
+        # OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES (CU-10).
+        # TODO(stage-5b): Route.GROUP_REACTION / GROUP_REACTION_REMOVAL -> verify the payload with
+        # the real test number, resolve/upsert the courier from the participant (number or
+        # @lid, docs/05 courier upsert and merge), then in THIS transaction
+        #   result = await orders.apply_reaction(session, settings, ReactionAdded(
+        #       group_message_id=event.reaction_target_id, courier_id=..., emoji=...,
+        #       inbound_event_id=row.id))  (ReactionRemoved for a removal)
+        # and outbound_ids += result.outbound_ids. Emoji-change payloads (a new reaction with no
+        # removal, or a removal followed by a new reaction) must be confirmed there too.
         # TODO(stage-7b): an admin (ADMIN_PHONES, by number or @lid) -> the same pattern with
         #   schedules.handle_admin_text(ctx, schedule_admin.AdminText(admin_phone=...,
         #       reply_jid=..., text=..., inbound_event_id=row.id), finalize=...)

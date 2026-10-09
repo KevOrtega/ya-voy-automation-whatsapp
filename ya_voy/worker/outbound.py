@@ -32,6 +32,7 @@ from ya_voy.db.models import Message, OutboundMessage, ReportRevision
 from ya_voy.domain.enums import MessageDirection, MessageKind, OutboundMessageType, OutboundStatus
 from ya_voy.messaging import catalog
 from ya_voy.messaging.outbox import enqueue_admin_alert, recipient_name
+from ya_voy.orders import publication
 from ya_voy.queue import enqueue_outbound_ids, enqueue_send_outbound
 from ya_voy.reports import service as reports
 from ya_voy.whatsapp.client import EvolutionClient, EvolutionError, SentMessage
@@ -164,6 +165,7 @@ async def _send_locked(
             # The report fails as a whole: admin_daily_report_failed replaces the generic alert.
             alert_ids = await reports.on_document_failed(session, settings, row)
         else:
+            await publication.on_group_message_failed(session, settings, row)
             alert_ids = await _failure_alert(session, settings, row)
         return _Outcome("failed", alert_ids=alert_ids)
 
@@ -173,7 +175,10 @@ async def _send_locked(
     _record_sent_message(session, row)
     if row.report_revision_id is not None:
         await reports.on_document_sent(session, row)
-    return _Outcome("sent")
+    # Order posts and replies in the group: group_message_id, late deletes (stage 5a/6a).
+    return _Outcome(
+        "sent", alert_ids=await publication.on_group_message_sent(session, settings, row)
+    )
 
 
 async def _failure_alert(

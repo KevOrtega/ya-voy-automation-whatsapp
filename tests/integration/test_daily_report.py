@@ -1,8 +1,9 @@
 """Daily report and corrections against Postgres/Redis (CU-16, CU-17, RF-48..RF-55).
 
-"Now" is frozen through ``schedule.repository.db_now``; Evolution is mocked with respx. Order
-transitions of stages 5/6 do not exist yet: the helpers below apply the documented SQL (docs/03)
-plus ``mark_report_for_correction`` in one transaction, as those stages must.
+"Now" is frozen through ``schedule.repository.db_now``; Evolution is mocked with respx. The helpers
+below apply the documented SQL (docs/03) plus ``mark_report_for_correction`` in one transaction, to
+control lock timing precisely; the real transitions (``ya_voy.orders``, stage 5a/6a) do the same and
+their report effect is covered in ``test_orders.py``.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def ctx(worker_ctx: Ctx, clock: Clock, evo: respx.MockRouter) -> dict[str, Any]:
     return worker_ctx()
 
 
-# --- data helpers (stages 5/6 write these rows for real) ---------------------------------------
+# --- data helpers (``ya_voy.orders`` writes these rows for real) -------------------------------
 
 
 class World:

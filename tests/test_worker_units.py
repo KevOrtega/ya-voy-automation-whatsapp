@@ -12,6 +12,7 @@ from ya_voy.whatsapp.payloads import parse_webhook
 from ya_voy.worker import WorkerSettings
 from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
+from ya_voy.worker.orders import alert_unclaimed_orders
 from ya_voy.worker.outbound import backoff_delay, send_outbound
 from ya_voy.worker.ratelimit import window_key
 from ya_voy.worker.reports import process_daily_reports, process_report_corrections
@@ -59,6 +60,7 @@ def test_worker_registers_stage_3_jobs_and_sweeps() -> None:
         recover_inbound_events,
         recover_outbound_messages,
         expire_drafts,
+        alert_unclaimed_orders,
         expire_schedule_confirmations,
         remind_still_closed,
         process_daily_reports,
