@@ -131,13 +131,16 @@ Los cierres y aperturas de horario no se anuncian en el grupo (RF-46).
 | `admin_daily_report_failed` | CU-16 / CU-17: se agotaron los intentos | ❗ No pude generar o enviar el reporte del {report_date} (versión {revision}). Error: {error}. |
 | `admin_rate_limited_sender` | CU-18: un remitente superó el límite (una vez por día y remitente) | ℹ️ {sender_name} mandó demasiados mensajes seguidos; los estoy ignorando por un rato. |
 | `admin_llm_failure` | CU-01: falla persistente del LLM | ❗ No pude procesar un mensaje de {store_name}: el servicio de lectura de pedidos no responde. |
-| `admin_outbound_failed` | Envío con `status = 'failed'` (incluye eliminar o editar en el grupo) | ❗ No se pudo enviar el mensaje `{template_key}` a {recipient_name} tras {attempts} intentos. |
+| `admin_outbound_failed` | Envío con `status = 'failed'` (incluye eliminar o editar en el grupo) | ❗ No se pudo enviar el mensaje `{template_key}` a {recipient_name} tras {attempts_text}. |
 | `admin_whatsapp_disconnected` | Evento `connection.update` con estado cerrado | ❗ El número del bot se desconectó de WhatsApp. Hay que volver a vincularlo desde el manager. |
 
 `{schedule_note}`: si hubo cierres o aperturas extra en el día, `"\nCambios de horario: {lista}"`; si no, vacío.
 `{recipient_name}` en `admin_outbound_failed`: `stores.display_name` o `couriers.display_name` del
 destinatario; si es el grupo de moteros, `"el grupo de moteros"`; si es un administrador, `"un administrador"`;
 si no se lo conoce, `"un destinatario sin nombre"`. Nunca un teléfono (RN-17).
+`{attempts_text}` en `admin_outbound_failed`: `outbound_messages.attempts` con singular o plural según el número:
+`"1 intento"` si es 1 (un error permanente no se reintenta) y `"N intentos"` en otro caso (`"3 intentos"`). Nunca
+`"intento(s)"`.
 `admin_whatsapp_disconnected` no podrá llegar mientras el número esté desconectado; se registra en logs y se
 envía al reconectar.
 

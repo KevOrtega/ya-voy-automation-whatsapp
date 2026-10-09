@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from tests.integration import factories as f
 from tests.integration.conftest import EVOLUTION_URL, queued
 from ya_voy.db.models import Message, OutboundMessage
-from ya_voy.messaging import catalog
 from ya_voy.worker import outbound
 from ya_voy.worker.outbound import BACKOFF_KEY, INTERVAL_LOCK_KEY, send_outbound
 
@@ -201,11 +200,8 @@ async def test_error_retries_with_backoff_then_fails_and_alerts(
             )
         ).all()
     assert len(alerts) == 2  # one per ADMIN_PHONES entry
-    assert alerts[0].body == catalog.render(
-        catalog.ADMIN_OUTBOUND_FAILED,
-        template_key="store_order_published",
-        recipient_name="Pizzería Test",
-        attempts=3,
+    assert alerts[0].body == (
+        "❗ No se pudo enviar el mensaje `store_order_published` a Pizzería Test tras 3 intentos."
     )
     alert_jobs = {a for (_, (a,)) in await queued(arq_redis, "send_outbound")}
     assert {a.id for a in alerts} <= alert_jobs
@@ -329,7 +325,10 @@ async def test_group_recipient_name_in_failure_alert(
             select(OutboundMessage).where(OutboundMessage.template_key == "admin_outbound_failed")
         )
     assert alert is not None
-    assert catalog.COURIERS_GROUP_NAME in alert.body
+    # Permanent error: one attempt, singular form.
+    assert alert.body == (
+        "❗ No se pudo enviar el mensaje `group_post_delete` a el grupo de moteros tras 1 intento."
+    )
 
 
 async def test_delete_and_edit_call_their_endpoints_without_history_rows(

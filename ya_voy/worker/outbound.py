@@ -183,7 +183,7 @@ async def _failure_alert(
         variables={
             "template_key": row.template_key,
             "recipient_name": await recipient_name(session, settings, row.recipient_jid),
-            "attempts": row.attempts,
+            "attempts_text": catalog.attempts_text(row.attempts),
         },
     )
 

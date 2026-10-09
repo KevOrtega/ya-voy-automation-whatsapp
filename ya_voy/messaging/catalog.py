@@ -17,7 +17,7 @@ TEMPLATES: dict[str, str] = {
         "ℹ️ {sender_name} mandó demasiados mensajes seguidos; los estoy ignorando por un rato."
     ),
     ADMIN_OUTBOUND_FAILED: (
-        "❗ No se pudo enviar el mensaje `{template_key}` a {recipient_name} tras {attempts} intentos."
+        "❗ No se pudo enviar el mensaje `{template_key}` a {recipient_name} tras {attempts_text}."
     ),
 }
 
@@ -25,6 +25,11 @@ TEMPLATES: dict[str, str] = {
 COURIERS_GROUP_NAME = "el grupo de moteros"
 ADMIN_RECIPIENT_NAME = "un administrador"
 UNKNOWN_RECIPIENT_NAME = "un destinatario sin nombre"
+
+
+def attempts_text(attempts: int) -> str:
+    """``{attempts_text}`` (doc 07): ``"1 intento"``, otherwise ``"N intentos"``."""
+    return f"{attempts} intento" if attempts == 1 else f"{attempts} intentos"
 
 
 def template_fields(template_key: str) -> set[str]:

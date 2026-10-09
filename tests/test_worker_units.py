@@ -92,12 +92,32 @@ def test_catalog_admin_outbound_failed_matches_doc_07() -> None:
         catalog.ADMIN_OUTBOUND_FAILED,
         template_key="group_order_assigned",
         recipient_name="el grupo de moteros",
-        attempts=5,
+        attempts_text=catalog.attempts_text(5),
     )
     assert text == (
         "❗ No se pudo enviar el mensaje `group_order_assigned` a el grupo de moteros "
         "tras 5 intentos."
     )
+
+
+@pytest.mark.parametrize(
+    ("attempts", "expected"),
+    [(1, "1 intento"), (2, "2 intentos"), (5, "5 intentos"), (11, "11 intentos")],
+)
+def test_attempts_text_singular_and_plural(attempts: int, expected: str) -> None:
+    assert catalog.attempts_text(attempts) == expected
+
+
+def test_admin_outbound_failed_singular_for_one_attempt() -> None:
+    text = catalog.render(
+        catalog.ADMIN_OUTBOUND_FAILED,
+        template_key="store_order_published",
+        recipient_name="Pizzería Test",
+        attempts_text=catalog.attempts_text(1),
+    )
+    assert text.endswith("a Pizzería Test tras 1 intento.")
+    assert "intentos" not in text
+    assert "intento(s)" not in text
 
 
 def test_catalog_rejects_missing_and_unknown_variables() -> None:
