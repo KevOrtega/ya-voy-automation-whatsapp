@@ -76,8 +76,9 @@ def _ts_now(*, onupdate: bool = False) -> Any:
 
 
 def _jsonb(default: str | None) -> Any:
+    # none_as_null: Python None is sent as SQL NULL (rejected by NOT NULL), never as JSON 'null'.
     return mapped_column(
-        JSONB,
+        JSONB(none_as_null=True),
         nullable=False,
         server_default=text(f"'{default}'::jsonb") if default is not None else None,
     )
