@@ -73,7 +73,7 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 | `expire_schedule_confirmations` | `schedule_overrides` en `pending_confirmation` con `confirmation_expires_at < now()` | Pasan a `expired` |
 | `remind_still_closed` | Hora local ≥ `BUSINESS_HOURS_START`, hay un `closed_until_further_notice` activo y no se avisó hoy | `admin_schedule_still_closed` |
 | `process_daily_reports` | `now() ≥ report_due_at(D)` para el día operativo D sin reporte, o reportes en `waiting`/`failed` | CU-16: espera pendientes, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES` del cierre efectivo (una vez), genera y envía la revisión 1 |
-| `process_report_corrections` | `daily_reports` en `correction_pending` sin pedidos pendientes de su fecha | CU-17: compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
+| `process_report_corrections` | `daily_reports` en `correction_pending` con `due_at <= now()`; si hay pendientes, espera (y si fue reabierto por una apertura extra, recordatorio a los `REPORT_PENDING_REMINDER_MINUTES`) | CU-17: sin pendientes, compara con la última revisión enviada; si hay cambios netos, genera y envía la corrección; si no, vuelve a `sent` |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` antiguos | Reencolar |
 | `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` |
@@ -218,6 +218,7 @@ Consideraciones:
 | R-13 | Un local confirma tarde (fuera de horario o con el borrador vencido) y cree que el pedido salió. | Al confirmar fuera de horario se responde explícitamente que no se envió (`store_order_not_sent_closed`); al vencer se avisa (`store_draft_expired`). |
 | R-14 | Una apertura extra pasada la medianoche mezcla pedidos de dos fechas calendario. | Día operativo con corte configurable; las horas después de medianoche se muestran como del día siguiente en el resumen de confirmación. |
 | R-15 | Muchas correcciones si se liberan o cancelan pedidos de días viejos. | Solo se envía una corrección cuando hay cambio neto y no quedan pendientes de esa fecha; varias modificaciones se acumulan en una sola corrección. |
+| R-16 | El administrador extiende un día ya reportado y espera ver los pedidos nuevos en el reporte original. | El resumen de confirmación avisa que irán en una corrección y a qué hora; la corrección lista cada pedido agregado. |
 
 ## 6. Variables de entorno
 

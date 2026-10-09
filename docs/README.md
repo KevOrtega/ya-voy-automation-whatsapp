@@ -36,7 +36,7 @@ plantillas) están en inglés, igual que el código.
 | Apertura extra | Ampliación del horario cargada por el admin ("hoy hasta las 00") y confirmada | `schedule_overrides` (`open_window`) |
 | Horario efectivo | Horario base más aperturas extra menos cierres activos; su fin es el cierre efectivo del día | `is_accepting_orders`, `report_due_at` |
 | Reporte diario | Excel con los pedidos del día operativo, enviado al admin al cierre efectivo cuando no quedan pendientes | `daily_reports`, `report_revisions` |
-| Corrección del reporte | Nueva versión del reporte cuando, después de enviado, un pedido cambió de motero o se canceló | `report_revisions.kind = 'correction'` |
+| Corrección del reporte | Nueva versión del reporte cuando, después de enviado, un pedido cambió de motero o se canceló, o se agregaron pedidos por una apertura extra | `report_revisions.kind = 'correction'` |
 | `pushName` | Nombre de perfil que el usuario se puso en WhatsApp | `display_name` |
 | LID | Identificador anónimo de WhatsApp (`xxxx@lid`) usado en grupos en lugar del número | `lid` |
 | JID | Identificador de chat de WhatsApp (`549...@s.whatsapp.net`, `...@g.us`) | `jid` |

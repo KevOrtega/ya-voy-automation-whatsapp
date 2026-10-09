@@ -337,7 +337,7 @@ sequenceDiagram
     Note over CR,AD: 23:40 Joel quita su reacción a YV-0123 (pedido del 09/10)
     CR->>DB: (en la transacción de la liberación) UPDATE daily_reports SET status = 'correction_pending' WHERE status = 'sent'
     Note over CR,AD: 23:45 Emiliano toma YV-0123
-    CR->>DB: SELECT daily_reports WHERE status = 'correction_pending' FOR UPDATE SKIP LOCKED
+    CR->>DB: SELECT daily_reports WHERE status = 'correction_pending' AND due_at <= now() FOR UPDATE SKIP LOCKED
     CR->>DB: ¿pendientes de D? No
     CR->>DB: comparar pedidos de D con snapshot de la revisión 1
     DB-->>CR: YV-0123 courier Joel pasa a Emiliano
@@ -400,7 +400,7 @@ sequenceDiagram
     W->>EVO: store_closed_today (si no se le respondió hace poco)
     EVO->>S: "Hoy no tomamos pedidos por lluvia."
 
-    Note over AD,S: Las aperturas siguen el mismo flujo. "hoy hasta las 00" genera kind = open_window<br/>(23:00 a 24:00) y corre la hora del reporte del día a las 24:00
+    Note over AD,S: Las aperturas siguen el mismo flujo. "hoy hasta las 00" genera kind = open_window<br/>(23:00 a 24:00) y corre la hora del reporte del día a las 24:00<br/>(si el reporte ya se envió, lo reabre: ver sección 8)
     AD->>EVO: "ya tomamos pedidos de nuevo"
     W->>LLM: parse_schedule(...)
     LLM-->>W: kind = reopen
@@ -414,7 +414,62 @@ sequenceDiagram
     W->>EVO: admin_schedule_applied
 ```
 
-## 8. Envío de mensajes salientes (bandeja de salida)
+## 8. Apertura extra después de enviado el reporte (corrección con pedidos agregados)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AD as Administrador
+    participant W as Worker
+    participant DB as PostgreSQL
+    participant CR as Worker (cron)
+    participant EVO as Evolution API
+    actor S as Local
+    actor C as Motero (Joel)
+
+    Note over AD,C: 23:05 el reporte del 09/10 (revisión 1) ya se envió
+    AD->>W: (vía Evolution) "hoy hasta la 01"
+    W->>W: parse y validate_schedule_intent: open_window 23:00 a 01:00 del 09/10 (dentro de 06:00 a 02:00)
+    W->>DB: INSERT schedule_overrides (open_window, pending_confirmation)
+    W->>EVO: admin_schedule_confirm
+    EVO->>AD: "Hoy 09/10 se toman pedidos también hasta la 01:00 (del 10/10). El reporte ya se envió: los pedidos nuevos irán en una corrección a la 01:00. ¿Lo aplico?"
+    AD->>W: (vía Evolution) "sí"
+    rect rgb(235, 245, 255)
+        Note over W,DB: Una transacción
+        W->>DB: UPDATE schedule_overrides SET status = 'active', confirmed_at
+        W->>DB: SELECT daily_reports WHERE report_date = '09/10' FOR UPDATE
+        W->>DB: UPDATE daily_reports SET status = 'correction_pending', due_at = 01:00, reopened_by_override_id, pending_reminder_sent_at = NULL
+    end
+    W->>EVO: admin_schedule_applied
+
+    S->>W: (vía Evolution) pedido nuevo a las 23:40, confirma con "sí"
+    W->>DB: orders YV-0130 (business_date = 09/10) published
+    C->>W: (vía Evolution) reacción a YV-0130
+    W->>DB: YV-0130 assigned a Joel
+
+    loop cada SCHEDULER_INTERVAL_SECONDS
+        CR->>DB: SELECT daily_reports WHERE status = 'correction_pending' AND due_at <= now() FOR UPDATE SKIP LOCKED
+    end
+    Note over CR: 01:00 vence due_at
+    CR->>DB: ¿pendientes del 09/10?
+    alt hay pendientes
+        opt now >= due_at + REPORT_PENDING_REMINDER_MINUTES y sin recordatorio
+            CR->>EVO: admin_report_pending_reminder (variante corrección)
+        end
+    else sin pendientes
+        CR->>DB: diff_snapshots(revisión 1, actual) devuelve added YV-0130 (Joel)
+        CR->>DB: INSERT report_revisions (revision = 2, kind = 'correction', changes, snapshot)
+        CR->>DB: INSERT outbound_messages (admin_daily_report_correction, daily_report:09/10:v2:phone)
+        CR->>EVO: POST /message/sendMedia
+        EVO->>AD: "Corrección del reporte del 09/10 (versión 2): pedido agregado YV-0130 (tomado por Joel)"
+        CR->>DB: UPDATE daily_reports SET status = 'sent', current_revision = 2, reopened_by_override_id = NULL
+    end
+```
+
+Si a la 01:00 no hubo pedidos nuevos ni otros cambios, `diff_snapshots` devuelve una lista vacía: no se crea
+revisión y el reporte vuelve a `sent` sin enviar nada (PA-01).
+
+## 9. Envío de mensajes salientes (bandeja de salida)
 
 Todos los envíos siguen el mismo patrón, que no se repite en los diagramas anteriores:
 

@@ -27,6 +27,7 @@ Variables comunes:
 | `{window_start}`, `{window_end}` | Horas de un cierre `closed_window` o una apertura `open_window` (`HH:MM`; después de medianoche se agrega "del {date+1}") |
 | `{effective_hours}` | Horario efectivo del día: base más aperturas menos cierres ("09:00 a 00:00") |
 | `{revision}` | Número de versión del reporte (2 = primera corrección) |
+| `{report_label}` | "El reporte" o, si es la espera de una corrección por apertura extra, "La corrección del reporte" |
 | `{changes_list}` | Cambios netos de una corrección, uno por línea (ver "Textos de cambios") |
 
 Bloque `{order_details}` (el mismo en el grupo, al motero y al local):
@@ -126,7 +127,7 @@ Los cierres y aperturas de horario no se anuncian en el grupo (RF-46).
 | `admin_order_unclaimed` | T15: `UNCLAIMED_ALERT_MINUTES` sin toma (una vez por período) | ⚠️ El pedido *{code}* lleva {minutes} minutos sin motero.<br/><br/>{order_details}<br/><br/>Sigue publicado. Si querés cancelarlo, escribí *cancelar {code}*. |
 | `admin_daily_report` | CU-16 (documento `.xlsx`; este es el pie) | 📊 Reporte del {report_date}: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados, {couriers_count} moteros con actividad.{schedule_note} |
 | `admin_daily_report_correction` | CU-17 (documento `.xlsx`; este es el pie) | 🛠️ *Corrección* del reporte del {report_date} (versión {revision}):<br/>{changes_list}<br/><br/>Totales actualizados: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados. Este archivo reemplaza a la versión anterior. |
-| `admin_report_pending_reminder` | CU-16: `REPORT_PENDING_REMINDER_MINUTES` después del cierre efectivo siguen pendientes (una vez, solo antes del primer envío) | ⏳ El reporte del {report_date} está listo, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*. |
+| `admin_report_pending_reminder` | CU-16 / CU-17: `REPORT_PENDING_REMINDER_MINUTES` después del cierre efectivo siguen pendientes (una vez por cierre efectivo: antes del primer envío y tras una apertura extra sobre un día ya reportado) | ⏳ {report_label} del {report_date} está listo, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*. |
 | `admin_daily_report_failed` | CU-16 / CU-17: se agotaron los intentos | ❗ No pude generar o enviar el reporte del {report_date} (versión {revision}). Error: {error}. |
 | `admin_rate_limited_sender` | CU-18: un remitente superó el límite (una vez por día y remitente) | ℹ️ {sender_name} mandó demasiados mensajes seguidos; los estoy ignorando por un rato. |
 | `admin_llm_failure` | CU-01: falla persistente del LLM | ❗ No pude procesar un mensaje de {store_name}: el servicio de lectura de pedidos no responde. |
@@ -141,6 +142,7 @@ Textos de cambios (`{changes_list}`), un renglón por pedido:
 
 | Cambio | Texto |
 |--------|-------|
+| `added` | • Pedido agregado *{code}* (tomado por {to_courier}) — o "(cancelado)" si se canceló. |
 | `courier_changed` | • El pedido *{code}* pasó de {from_courier} a {to_courier}. |
 | `cancelled` | • El pedido *{code}* fue cancelado (estaba asignado a {from_courier}). |
 
@@ -165,17 +167,16 @@ Ejemplo: "🛠️ *Corrección* del reporte del 09/10/2026 (versión 2):<br/>•
 | `admin_schedule_applied` | CU-14: confirmado | ✅ Listo. {override_summary}<br/>{status_line} |
 | `admin_schedule_rejected` | CU-14: respondió "no" | Ok, no cambié nada. |
 | `admin_schedule_confirmation_expired` | CU-14: "sí" fuera de plazo | La confirmación venció y no cambié nada. Si querés, mandame la instrucción de nuevo. |
-| `admin_schedule_invalid` | CU-14: validación fallida (incluye aperturas fuera de límites o de un día ya reportado) | No pude aplicar eso: {reason}. Probá de nuevo, por ejemplo: _de 15 a 18 no tomamos pedidos_ o _hoy hasta las 00_. |
+| `admin_schedule_invalid` | CU-14: validación fallida (incluye aperturas fuera de límites) | No pude aplicar eso: {reason}. Probá de nuevo, por ejemplo: _de 15 a 18 no tomamos pedidos_ o _hoy hasta las 00_. |
 | `admin_schedule_parse_error` | CU-14: falla del LLM | No pude interpretar el mensaje en este momento. Probá de nuevo en unos minutos. |
 | `admin_schedule_nothing_to_reopen` | CU-14: `reopen` sin cierres en vigor | Ya se están tomando pedidos; no hay ningún cierre en vigor.{future_closures_note} |
 | `admin_schedule_still_closed` | RF-45: inicio del horario base con cierre "hasta nuevo aviso" (una vez por día) | 🔒 Recordatorio: la toma de pedidos sigue cerrada hasta nuevo aviso{reason_text} (desde el {since}). Para reabrir, escribí _ya tomamos pedidos de nuevo_. |
 | `admin_schedule_status` | CU-15: `estado` u `horario` | 📅 *Hoy {date}*<br/>Horario: {effective_hours} (base {hours_start} a {hours_end})<br/>Aperturas extra: {openings_list}<br/>Cierres: {closures_list}<br/>Ahora: {accepting_label}<br/>Sin tomar: {pending_codes}<br/>Pedidos de hoy: {orders_count} publicados, {assigned_count} tomados, {cancelled_count} cancelados<br/>Reporte: {report_status_label}{pending_confirmation_note} |
 
 Valores de `{reason}` en `admin_schedule_invalid` (ejemplos): "la apertura tiene que quedar entre las 06:00 y
-las 02:00 del día siguiente", "ese horario ya está dentro del horario normal", "el reporte de ese día ya se
-generó", "la hora de fin tiene que ser posterior a la de inicio".
-`{report_status_label}`: "se genera a las {due_time}", "retenido (pendientes: {codes})", "enviado" o
-"enviado, corrección pendiente".
+las 02:00 del día siguiente", "ese horario ya está dentro del horario normal", "la hora de fin tiene que ser posterior a la de inicio".
+`{report_status_label}`: "se genera a las {due_time}", "retenido (pendientes: {codes})", "enviado",
+"enviado, corrección pendiente" o "reabierto por apertura extra, corrección a las {due_time}".
 
 Resúmenes de horario (`{override_summary}`), siempre con fecha y horas explícitas en formato 24 h:
 
@@ -184,12 +185,16 @@ Resúmenes de horario (`{override_summary}`), siempre con fecha y horas explíci
 | `closed_today` | Hoy {date} no se toman más pedidos{reason_paren}. |
 | `closed_until_further_notice` | Desde ahora no se toman pedidos hasta que me avises{reason_paren}. |
 | `closed_window` | El {date} de {window_start} a {window_end} no se toman pedidos{reason_paren}. |
-| `open_window` | El {date} se toman pedidos también de {window_start} a {window_end}{reason_paren}. Horario de ese día: {effective_hours}. El reporte del día se genera a las {window_end}. |
+| `open_window` | El {date} se toman pedidos también de {window_start} a {window_end}{reason_paren}. Horario de ese día: {effective_hours}. {report_note} |
 | `reopen` | Vuelvo a tomar pedidos ahora. Se levanta: {closures_list}.{future_closures_note} |
 
 Ejemplo de `open_window` para "hoy hasta las 00" un 09/10: "El 09/10/2026 se toman pedidos también de 23:00 a
-00:00 (del 10/10). Horario de ese día: 09:00 a 00:00. El reporte del día se genera a las 00:00." La frase sobre el
-reporte solo se incluye si la apertura termina después del cierre efectivo vigente.
+00:00 (del 10/10). Horario de ese día: 09:00 a 00:00. El reporte del día se genera a las 00:00."
+
+`{report_note}`: si el reporte del día
+todavía no se generó y la apertura termina después del cierre efectivo vigente, "El reporte del día se genera a las
+{window_end}."; si el reporte ya se envió, "El reporte de ese día ya se envió: los pedidos nuevos irán en una
+corrección a las {window_end}."; si no, vacío.
 
 `{reason_paren}`: `" (motivo: {reason})"` o vacío. `{accepting_label}`: "tomando pedidos" o "cerrado ({motivo})".
 `{future_closures_note}`: si quedan cierres futuros hoy, `" Sigue programado: {lista}."`; si no, vacío.

@@ -145,7 +145,26 @@ UPDATE daily_reports
    AND status = 'sent';
 ```
 
-Así la corrección (CU-17) no depende de que la tarea periódica detecte el cambio por otra vía.
+Así la corrección (CU-17) no depende de que la tarea periódica detecte el cambio por otra vía. Como `due_at` ya
+pasó, la corrección sale en cuanto no quedan pendientes del día.
+
+La confirmación de una apertura extra (`open_window`) para un día ya reportado reabre el reporte en la misma
+transacción, y además corre `due_at` al nuevo cierre efectivo (RF-55):
+
+```sql
+UPDATE daily_reports
+   SET status = 'correction_pending',
+       due_at = :new_report_due_at,
+       reopened_by_override_id = :override_id,
+       pending_reminder_sent_at = NULL,
+       correction_requested_at = COALESCE(correction_requested_at, now()),
+       updated_at = now()
+ WHERE report_date = :override_business_date
+   AND status IN ('sent', 'generating', 'correction_pending');
+```
+
+Si el reporte del día todavía no se generó (`waiting` o sin fila), no hace falta nada: `report_due_at(D)` ya
+incluye la apertura.
 
 ## 2. Cambio de horario (`schedule_overrides`)
 
@@ -191,7 +210,9 @@ def is_accepting_orders(now: datetime) -> AcceptanceDecision:
 
 def report_due_at(business_date: date) -> datetime:
     """Effective close of the business day: the later of BUSINESS_HOURS_END and the end of any
-    active open_window for that day. Closures never move it earlier (they can be lifted)."""
+    active open_window for that day. Closures never move it earlier (they can be lifted).
+    Used for the original report and, when the day is extended after its report was sent,
+    for the correction that lists the orders added during the extension."""
 ```
 
 ```sql

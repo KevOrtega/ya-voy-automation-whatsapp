@@ -346,7 +346,7 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 ## CU-11 Descartar webhook duplicado
 
-- **Actor:** Sistema. **Requisitos:** RF-58. **RNF:** RNF-01, RNF-03.
+- **Actor:** Sistema. **Requisitos:** RF-59. **RNF:** RNF-01, RNF-03.
 
 1. La API recibe un evento y ejecuta:
    ```sql
@@ -395,7 +395,7 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 ## CU-14 Modificar horario del día
 
-- **Actor:** Administrador. **Requisitos:** RF-41 a RF-46, RF-56. **Reglas:** RN-24 a RN-28.
+- **Actor:** Administrador. **Requisitos:** RF-41 a RF-46, RF-57. **Reglas:** RN-24 a RN-28.
 - **Precondición:** el remitente privado es un número de `ADMIN_PHONES` y el texto no es un comando (`cancelar`, `liberar`, `estado`, `horario`, `ayuda`) ni una respuesta de confirmación.
 
 **Flujo principal** (ejemplo: "hoy no tomamos pedidos por lluvia")
@@ -424,13 +424,14 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 - **1a. El LLM indica que no es una instrucción de horario** (`kind` nulo): se responde `admin_help`.
 - **1b. El LLM falla:** `admin_schedule_parse_error`; no se cambia nada.
-- **2a. Validación fallida** (ventana en el pasado, inicio posterior al fin, cierre totalmente fuera del horario efectivo, apertura totalmente dentro del horario base o fuera de los límites `SCHEDULE_EARLIEST_OPEN_TIME`–`SCHEDULE_LATEST_CLOSE_TIME`, apertura para un día cuyo reporte ya se generó): `admin_schedule_invalid` con el motivo; no se crea solicitud.
+- **2a. Validación fallida** (ventana en el pasado, inicio posterior al fin, cierre totalmente fuera del horario efectivo, apertura totalmente dentro del horario base o fuera de los límites `SCHEDULE_EARLIEST_OPEN_TIME`–`SCHEDULE_LATEST_CLOSE_TIME`): `admin_schedule_invalid` con el motivo; no se crea solicitud.
 - **2b. `reopen` sin cierres en vigor:** `admin_schedule_nothing_to_reopen`, sin pedir confirmación.
 - **6a. El administrador responde "no":** `status = 'rejected'`, `admin_schedule_rejected`.
 - **6b. Responde "sí" con la solicitud vencida:** `admin_schedule_confirmation_expired`; no se aplica.
 - **6c. Escribe otra instrucción en lugar de confirmar:** la solicitud anterior pasa a `superseded` y se procesa la nueva desde el paso 1.
 - **6d. No responde:** una tarea periódica marca `expired` las solicitudes vencidas; no se envía mensaje.
-- **7a. Al confirmar una apertura, el reporte de ese día ya empezó a generarse** (carrera): la confirmación bloquea la fila de `daily_reports` del día; si su estado ya no es `waiting`, se rechaza con `admin_schedule_invalid` ("el reporte del día ya se generó").
+- **7a. Apertura para un día cuyo reporte ya se envió** (ejemplo: a las 23:30, con el reporte del 09/10 enviado a las 23:05, "hoy hasta la 01"): en la misma transacción de la confirmación se bloquea la fila de `daily_reports` del día y se la reabre: `status = 'correction_pending'`, `due_at` = nuevo cierre efectivo (01:00), `reopened_by_override_id` = la apertura, `pending_reminder_sent_at = NULL`. El resumen de confirmación ya lo advertía ("El reporte de ese día ya se envió; los pedidos de la apertura irán en una corrección a la 01:00"). Continúa en CU-17, variante "Apertura extra después del reporte".
+- **7b. Al confirmar una apertura, el reporte de ese día se está generando o enviando** (carrera): la confirmación espera el bloqueo de la fila; la apertura se aplica igual y el reporte queda `correction_pending` como en 7a. La corrección se compara contra la revisión que se estaba enviando.
 - **8a. Cierre "hasta nuevo aviso" vigente al comenzar un nuevo día:** al llegar `BUSINESS_HOURS_START` se envía `admin_schedule_still_closed` (una vez por día).
 
 **Postcondición:** el cambio queda `active` (o el `reopen` queda `applied` con los cierres levantados), con el texto original y la interpretación guardados.
@@ -463,8 +464,9 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 **Flujos alternativos**
 
 - **3a. Hay pedidos pendientes:** el reporte queda en `waiting` (con `pending_orders_count` actualizado) y se vuelve a verificar en la próxima ejecución.
-- **3b. Sigue en `waiting` `REPORT_PENDING_REMINDER_MINUTES` después de `due_at`** (01:00 en un día normal): se envía una vez `admin_report_pending_reminder` con los códigos pendientes y se fija `pending_reminder_sent_at`. El reporte espera sin límite.
+- **3b. Sigue en `waiting` (o en `correction_pending` reabierto por una apertura extra) `REPORT_PENDING_REMINDER_MINUTES` después de `due_at`** (01:00 en un día normal): se envía una vez `admin_report_pending_reminder` con los códigos pendientes y se fija `pending_reminder_sent_at`. El reporte espera sin límite.
 - **1a. El administrador confirma una apertura extra para D antes de que el reporte se genere:** `report_due_at(D)` se recalcula en cada ejecución, así que el reporte se corre a la nueva hora.
+- **1b. El administrador confirma una apertura extra para D después de enviado el reporte:** el reporte se reabre y los pedidos de la apertura se informan en una corrección (CU-14 7a, CU-17).
 - **El worker estuvo caído:** al volver, la tarea procesa todas las fechas con `due_at` vencido y sin reporte enviado.
 - **El worker se cae a mitad de la generación:** una revisión en `generating` por más de 10 minutos se trata como `failed` y se reintenta.
 - **Falla la generación:** `attempts + 1`; se reintenta hasta `DAILY_REPORT_MAX_ATTEMPTS` y luego se envía `admin_daily_report_failed`.
@@ -475,8 +477,9 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 ## CU-17 Enviar corrección del reporte
 
-- **Actor:** Planificador. **Requisitos:** RF-53, RF-54. **Reglas:** RN-22, RN-23.
-- **Disparador:** un pedido de un día cuyo reporte ya se envió se libera (T13, T18) o se cancela (T16, T17). En la misma transacción se marca `daily_reports.status = 'correction_pending'`.
+- **Actor:** Planificador. **Requisitos:** RF-53 a RF-55. **Reglas:** RN-22, RN-23, RN-27.
+- **Disparador:** un pedido de un día cuyo reporte ya se envió se libera (T13, T18) o se cancela (T16, T17), o el administrador confirma una apertura extra para ese día (CU-14 7a). En la misma transacción se marca `daily_reports.status = 'correction_pending'`.
+- **Condición de envío:** `now() >= due_at` (para liberaciones y cancelaciones `due_at` ya pasó; para una apertura es el nuevo cierre efectivo) y no quedan pedidos pendientes del día.
 
 **Flujo principal** (ejemplo: Joel quita su reacción a YV-0123 y lo toma Emiliano)
 
@@ -490,10 +493,25 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 **Flujos alternativos**
 
-- **4a. No hay cambios netos** (por ejemplo, Joel liberó y volvió a tomar el mismo pedido): no se genera revisión y el reporte vuelve a `sent` (RN-23, PA-01).
+- **4a. No hay cambios netos** (por ejemplo, Joel liberó y volvió a tomar el mismo pedido): no se genera revisión y el reporte vuelve a `sent` (RN-23, DC-31).
 - **Cancelación después del reporte:** el cambio se informa como "el pedido YV-0123 fue cancelado (estaba asignado a Joel)".
 - **Varios cambios antes de resolverse:** se agrupan en una sola corrección con un renglón por pedido (cambio neto respecto de la última versión enviada).
-- **Pendientes sin resolver por mucho tiempo:** no hay recordatorio específico; aplica la alerta de pedido sin tomar (CU-08).
+- **Pendientes sin resolver por mucho tiempo:** en correcciones por liberación o cancelación no hay recordatorio específico; aplica la alerta de pedido sin tomar (CU-08). En correcciones por apertura extra aplica el recordatorio de CU-16 3b.
+
+**Variante: apertura extra después del reporte** (RF-55, DC-34)
+
+1. 23:05: se envía el reporte del 09/10 (revisión 1, 40 pedidos).
+2. 23:30: el administrador escribe "hoy hasta la 01" y confirma. La apertura queda `active` (23:00 a 01:00; en la práctica, desde la confirmación) y el reporte del 09/10 queda `correction_pending` con `due_at` = 01:00 (CU-14 7a).
+3. Entre las 23:30 y la 01:00 entran YV-0130 y YV-0131 (día operativo 09/10); Joel toma YV-0130 y Emiliano YV-0131.
+4. 01:00: la tarea periódica ve `now() >= due_at` y cuenta pendientes del 09/10. Si quedan, espera; si a las 03:00 (`due_at + REPORT_PENDING_REMINDER_MINUTES`) siguen, envía una vez `admin_report_pending_reminder` en su variante de corrección.
+5. Sin pendientes: compara con el `snapshot` de la revisión 1. Los pedidos que no estaban son cambios `added`; se suman los cambios de pedidos ya reportados, si los hubo.
+6. Crea la revisión 2 y envía `admin_daily_report_correction`:
+   "🛠️ Corrección del reporte del 09/10 (versión 2): pedido agregado YV-0130 (tomado por Joel); pedido agregado YV-0131 (tomado por Emiliano)."
+7. El reporte vuelve a `sent` (`current_revision = 2`) y se limpia `reopened_by_override_id`.
+
+- **No entró ningún pedido durante la apertura** (y no hubo otros cambios): no se envía corrección; el reporte vuelve a `sent` (PA-01).
+- **Otra apertura antes del nuevo cierre** ("mejor hasta las 02"): se recalcula `due_at`; sigue siendo una sola corrección.
+- **Pedido de la apertura cancelado antes de la corrección:** figura como agregado con estado "Cancelado".
 
 ---
 

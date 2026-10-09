@@ -104,7 +104,7 @@ automática de pedidos, integración con la API oficial de WhatsApp (Cloud API) 
 | RF-39 | El administrador interviene pedidos escribiendo al bot por privado: `cancelar {código}` y `liberar {código}`. Cada intervención genera las mismas notificaciones que la acción equivalente del local o del motero, y además se avisa al local. |
 | RF-40 | El administrador consulta el estado del día con `estado` u `horario`: horario efectivo (base, aperturas y cierres), si se están tomando pedidos, pedidos sin tomar, conteos del día y hora prevista del reporte. |
 | RF-41 | El administrador puede modificar el horario escribiendo en lenguaje natural ("hoy no tomamos pedidos por lluvia", "hoy no tomamos pedidos hasta nuevo aviso", "de 15 a 18 no tomaremos pedidos hoy", "hoy hasta las 00", "ya tomamos pedidos de nuevo"). Un LLM interpreta el mensaje a un esquema estructurado (`ScheduleOverrideIntent`) con tipo `closed_today`, `closed_until_further_notice`, `closed_window`, `open_window` o `reopen`, y motivo opcional. La validación del resultado es determinística. |
-| RF-42 | Las aperturas extra (`open_window`) deben quedar dentro de los límites `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del día siguiente), deben agregar tiempo fuera del horario base y solo pueden cargarse para un día cuyo reporte original todavía no se generó. |
+| RF-42 | Las aperturas extra (`open_window`) deben quedar dentro de los límites `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del día siguiente), y deben agregar tiempo fuera del horario base. Pueden cargarse también para un día cuyo reporte ya se envió: en ese caso el reporte se reabre (RF-55). |
 | RF-43 | Antes de aplicar un cambio de horario, el bot responde con un resumen en español claro y pide confirmación (`sí` / `no`). Solo se aplica si el administrador confirma dentro de `SCHEDULE_CONFIRMATION_TTL_MINUTES` (5); si no, la solicitud vence sin efecto. |
 | RF-44 | `reopen` levanta los cierres que están en vigor al momento de confirmar; los cierres futuros y las aperturas se mantienen y se informan en el resumen. |
 | RF-45 | Si hay un cierre "hasta nuevo aviso" activo, al comenzar el horario base de cada día se le recuerda al administrador (`admin_schedule_still_closed`). |
@@ -117,21 +117,22 @@ automática de pedidos, integración con la API oficial de WhatsApp (Cloud API) 
 |----|-----------|
 | RF-48 | El reporte de un día operativo se prepara a partir del cierre efectivo de ese día (el fin del horario base o de la última apertura extra, el que sea más tarde; 23:00 por defecto). Es un archivo `.xlsx` que se envía como documento de WhatsApp a cada número de `ADMIN_PHONES`. |
 | RF-49 | El reporte no se envía mientras haya pedidos del día pendientes (borradores, pedidos esperando confirmación o pedidos publicados sin tomar). El worker vuelve a verificar periódicamente y lo envía en cuanto todos están tomados, cancelados o vencidos. |
-| RF-50 | Si `REPORT_PENDING_REMINDER_MINUTES` (120) después del cierre efectivo (01:00 en un día normal) siguen quedando pedidos pendientes, se le recuerda una vez al administrador, con sus códigos, que los tome o cancele. El reporte espera sin límite. |
+| RF-50 | Si `REPORT_PENDING_REMINDER_MINUTES` (120) después del cierre efectivo (01:00 en un día normal) siguen quedando pedidos pendientes, se le recuerda una vez al administrador, con sus códigos, que los tome o cancele. El reporte espera sin límite. La misma regla aplica a la corrección por apertura extra (RF-55), contando desde el nuevo cierre efectivo. |
 | RF-51 | La hoja `Resumen` tiene una fila por motero con actividad en los pedidos del día: nombre, teléfono (si se conoce), cantidad de pedidos tomados, liberados y cancelados después de asignados. |
 | RF-52 | La hoja `Pedidos` tiene una fila por pedido publicado del día: código, horas de creación y asignación (en hora de Buenos Aires), nombre del local, dirección de retiro, dirección de entrega, producto, medio de pago, nombre del motero y estado. |
 | RF-53 | Si después de enviado el reporte un pedido del día se libera o se cancela, el sistema espera a que no queden pendientes de ese día y envía un reporte corregido, rotulado como corrección, con número de versión y la lista de cambios respecto de la última versión enviada ("Corrección: el pedido YV-0123 pasó de Joel a Emiliano"; "Corrección: el pedido YV-0123 fue cancelado (estaba asignado a Joel)"). |
 | RF-54 | Cada versión del reporte (original y correcciones) se envía una sola vez por destinatario, aunque el worker se reinicie o la tarea se ejecute más de una vez. Si el worker estuvo caído, los reportes pendientes se procesan en cuanto vuelve. |
+| RF-55 | Si el administrador confirma una apertura extra para un día cuyo reporte ya se envió, el reporte de ese día se reabre: al nuevo cierre efectivo, y cuando no queden pedidos pendientes del día (con la misma espera y el mismo recordatorio que el reporte original), se envía un reporte corregido, rotulado como corrección, que lista los pedidos agregados durante la apertura ("Corrección: pedido agregado YV-0130, tomado por Joel") junto con cualquier otro cambio pendiente. Si durante la apertura no hubo pedidos ni otros cambios, no se envía corrección. |
 
 ### Auditoría e idempotencia
 
 | ID | Requisito |
 |----|-----------|
-| RF-55 | Todo cambio de estado de un pedido queda registrado en un log de auditoría (`order_events`). |
-| RF-56 | Todo cambio de horario (solicitado, confirmado, rechazado, vencido o levantado) queda registrado en `schedule_overrides`, con el texto original del administrador. |
-| RF-57 | Todos los mensajes entrantes y salientes quedan registrados como historial de conversación (`messages`). |
-| RF-58 | Los eventos duplicados del webhook (mismo id de mensaje de WhatsApp) se procesan una sola vez. |
-| RF-59 | Los mensajes salientes (textos, documentos, eliminaciones y ediciones) se envían a través de una bandeja de salida (`outbound_messages`) con clave de idempotencia, en orden por destinatario. |
+| RF-56 | Todo cambio de estado de un pedido queda registrado en un log de auditoría (`order_events`). |
+| RF-57 | Todo cambio de horario (solicitado, confirmado, rechazado, vencido o levantado) queda registrado en `schedule_overrides`, con el texto original del administrador. |
+| RF-58 | Todos los mensajes entrantes y salientes quedan registrados como historial de conversación (`messages`). |
+| RF-59 | Los eventos duplicados del webhook (mismo id de mensaje de WhatsApp) se procesan una sola vez. |
+| RF-60 | Los mensajes salientes (textos, documentos, eliminaciones y ediciones) se envían a través de una bandeja de salida (`outbound_messages`) con clave de idempotencia, en orden por destinatario. |
 
 ## 4. Requisitos no funcionales
 
@@ -179,11 +180,11 @@ automática de pedidos, integración con la API oficial de WhatsApp (Cloud API) 
 | RN-20 | Un pedido cancelado deja de estar en el grupo: se eliminan la publicación y las respuestas del bot sobre ese pedido (o se marcan como CANCELADO si no se pueden eliminar). |
 | RN-21 | Cada pedido pertenece al día operativo (`business_date`) en que se creó su borrador. El reporte del día D cubre los pedidos publicados de D. Los conteos por motero son: tomados = pedidos de D asignados a él al generar la versión del reporte; liberados = liberaciones de pedidos de D que lo tenían asignado; cancelados = pedidos de D cancelados mientras estaban asignados a él. |
 | RN-22 | Una versión del reporte se envía una sola vez a cada administrador y solo cuando no quedan pedidos pendientes de esa fecha. |
-| RN-23 | Una corrección se genera solo si, comparando con la última versión enviada, cambió el estado o el motero de algún pedido. Una liberación seguida de una nueva toma por el mismo motero no genera corrección. |
+| RN-23 | Una corrección se genera solo si, comparando con la última versión enviada, cambió el estado o el motero de algún pedido o hay pedidos publicados nuevos del día. Una liberación seguida de una nueva toma por el mismo motero no genera corrección. |
 | RN-24 | Un cambio de horario solo se aplica después de la confirmación explícita del administrador. Cada administrador tiene como máximo una solicitud pendiente de confirmación; una instrucción nueva reemplaza a la anterior. |
 | RN-25 | Las aperturas extra (`open_window`) amplían el horario base dentro de los límites configurados; los cierres lo restringen. Ante una superposición, gana el cierre. |
 | RN-26 | `closed_today` cierra desde la confirmación hasta el fin del día operativo (incluidas las aperturas extra de ese día); `closed_until_further_notice` cierra desde la confirmación hasta un `reopen`; `closed_window` y `open_window` rigen entre las horas indicadas de la fecha indicada (hoy por defecto, nunca en el pasado). |
-| RN-27 | Una apertura extra solo puede cargarse para un día cuyo reporte original todavía no se generó. |
+| RN-27 | Una apertura extra puede cargarse para un día cuyo reporte todavía no se generó (el reporte se corre al nuevo cierre efectivo) o ya se envió (el reporte se reabre y los pedidos de la apertura se informan en una corrección al nuevo cierre efectivo). Nunca para un día operativo pasado. |
 | RN-28 | Los cambios de horario no afectan a pedidos ya publicados o asignados: se pueden seguir tomando, liberando y cancelando. |
 
 ## 6. Datos del pedido
@@ -253,13 +254,14 @@ Ejemplo canónico de mensaje de un local:
 | DC-28 | Recordatorio de reporte retenido (ex PA-05) | Uno solo; el reporte espera sin límite. |
 | DC-29 | Confirmación del local | Antes de publicar, el bot muestra el resumen del pedido y el local debe responder SÍ; puede corregir o cancelar en ese paso. |
 | DC-30 | Cancelación de pedidos publicados | Se elimina la publicación del grupo. Si ya lo había tomado un motero, se le avisa por privado con el detalle. Igual para el local y el administrador; si cancela el administrador, se avisa al local. |
+| DC-31 | Liberación y nueva toma por el mismo motero después del reporte (ex PA-01, segunda ronda) | No genera corrección (RN-23). |
+| DC-32 | Mensajes del grupo al cancelar (ex PA-02, segunda ronda) | Se eliminan la publicación y también las respuestas del bot sobre ese pedido ("Asignado a…", "vuelve a estar disponible"). |
+| DC-33 | Límites de las aperturas extra (ex PA-03, segunda ronda) | Entre las 06:00 y las 02:00 del día siguiente (`SCHEDULE_EARLIEST_OPEN_TIME`, `SCHEDULE_LATEST_CLOSE_TIME`). |
+| DC-34 | Extender un día ya reportado (ex PA-04, segunda ronda) | Se permite. El reporte del día se reabre y, al nuevo cierre efectivo y sin pendientes, se envía una corrección que lista los pedidos agregados (RF-55, RN-27). |
+| DC-35 | Plazo para confirmar el pedido (ex PA-05, segunda ronda) | 30 minutos sin actividad, igual que el borrador (`DRAFT_TTL_MINUTES`). |
 
 ## 9. Preguntas abiertas
 
 | ID | Pregunta | Propuesta por defecto |
 |----|----------|------------------------|
-| PA-01 | Si un pedido se libera y lo vuelve a tomar el mismo motero después del reporte, el conteo de "liberados" cambia pero no el resultado. ¿Se envía corrección igual? | No (RN-23); el conteo actualizado aparece en la próxima corrección, si la hay. |
-| PA-02 | Al cancelar, ¿se borran también los mensajes "Asignado a…" del bot en el grupo, o solo la publicación? | Se borran todos los mensajes del bot sobre ese pedido. |
-| PA-03 | ¿Hasta qué hora como máximo se puede extender? | Hasta las 02:00 del día siguiente, y no antes de las 06:00 (`SCHEDULE_LATEST_CLOSE_TIME`, `SCHEDULE_EARLIEST_OPEN_TIME`). |
-| PA-04 | ¿Se puede extender el horario de un día cuyo reporte ya se generó (por ejemplo, a las 23:30 "hoy hasta la 01")? | No; se responde que el reporte del día ya se generó (RN-27). |
-| PA-05 | ¿Cuánto tiempo tiene el local para confirmar el resumen? | El mismo vencimiento del borrador, 30 minutos sin actividad (`DRAFT_TTL_MINUTES`). |
+| PA-01 | Si el administrador extiende un día ya reportado y durante la apertura no entra ningún pedido (ni hay otros cambios), ¿se le avisa algo? | No se envía corrección ni aviso; `estado` muestra el reporte como enviado sin cambios. |

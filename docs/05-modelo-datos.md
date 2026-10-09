@@ -42,6 +42,7 @@ erDiagram
     daily_reports ||--o{ report_revisions : "has versions"
     report_revisions |o--o{ outbound_messages : "sent as"
     schedule_overrides |o--o{ schedule_overrides : "cancels"
+    schedule_overrides |o--o{ daily_reports : "reopens"
     inbound_events |o--o{ schedule_overrides : "requested by"
 
     stores {
@@ -178,6 +179,7 @@ erDiagram
         timestamptz last_checked_at
         timestamptz pending_reminder_sent_at
         timestamptz correction_requested_at
+        bigint reopened_by_override_id FK
         timestamptz created_at
         timestamptz updated_at
     }
@@ -438,13 +440,14 @@ correcciones (RN-22, RN-23).
 |---------|------|---------------|-------|
 | `id` | `bigint` | PK, identity | |
 | `report_date` | `date` | `NOT NULL`, `UNIQUE` | Día operativo (`business_date`) que cubre el reporte. |
-| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','sent','correction_pending','failed'))` | `waiting`: hay pendientes antes del primer envío. `correction_pending`: hubo cambios después de un envío. |
-| `due_at` | `timestamptz` | `NOT NULL` | Cierre efectivo del día (`report_due_at(D)`); se recalcula mientras está `waiting`. |
+| `status` | `text` | `NOT NULL`, `CHECK (status IN ('waiting','generating','sent','correction_pending','failed'))` | `waiting`: hay pendientes antes del primer envío. `correction_pending`: hubo cambios después de un envío o el día se extendió con una apertura extra. |
+| `due_at` | `timestamptz` | `NOT NULL` | Cierre efectivo del día (`report_due_at(D)`); se recalcula mientras está `waiting` y cuando una apertura extra reabre el reporte. Ninguna versión se envía antes de `due_at`. |
 | `current_revision` | `int` | `NOT NULL DEFAULT 0` | Última versión enviada (0 = ninguna). |
 | `pending_orders_count` | `int` | `NOT NULL DEFAULT 0` | Última cuenta de pendientes. |
 | `last_checked_at` | `timestamptz` | nullable | Última verificación de pendientes. |
-| `pending_reminder_sent_at` | `timestamptz` | nullable | Recordatorio de `REPORT_PENDING_REMINDER_MINUTES` enviado (una vez, solo antes del primer envío). |
+| `pending_reminder_sent_at` | `timestamptz` | nullable | Recordatorio de `REPORT_PENDING_REMINDER_MINUTES` enviado (una vez por cierre efectivo: antes del primer envío y en cada reapertura por apertura extra, que lo vuelve a `NULL`). |
 | `correction_requested_at` | `timestamptz` | nullable | Primer cambio posterior al último envío. |
+| `reopened_by_override_id` | `bigint` | FK → `schedule_overrides.id`, nullable | Apertura extra que reabrió el reporte (RF-55). Mientras no es nulo, aplica el recordatorio de pendientes. Se limpia al enviar la corrección o al volver a `sent` sin cambios. |
 | `created_at`, `updated_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 
 ### `report_revisions`
@@ -459,7 +462,7 @@ Cada versión del reporte. La revisión 1 es el original; las siguientes son cor
 | `kind` | `text` | `NOT NULL`, `CHECK (kind IN ('initial','correction'))` | |
 | `status` | `text` | `NOT NULL`, `CHECK (status IN ('generating','generated','sent','failed'))` | |
 | `snapshot` | `jsonb` | `NOT NULL` | Foto de los pedidos del día: `{order_id: {code, status, courier_id, courier_name}}`. Base para calcular la próxima corrección. |
-| `changes` | `jsonb` | `NOT NULL DEFAULT '[]'` | Cambios respecto de la revisión anterior: `[{"code": "YV-0123", "type": "courier_changed", "from": "Joel", "to": "Emiliano"}]`. Tipos: `courier_changed`, `cancelled`. |
+| `changes` | `jsonb` | `NOT NULL DEFAULT '[]'` | Cambios respecto de la revisión anterior: `[{"code": "YV-0123", "type": "courier_changed", "from": "Joel", "to": "Emiliano"}]`. Tipos: `added`, `courier_changed`, `cancelled`. |
 | `file_name` | `text` | nullable | `reporte-ya-voy-2026-10-09.xlsx`, `reporte-ya-voy-2026-10-09-correccion-2.xlsx`. |
 | `file_content` | `bytea` | nullable | El archivo (decenas de KB). Se borra por retención. |
 | `attempts` | `int` | `NOT NULL DEFAULT 0` | |
@@ -467,10 +470,11 @@ Cada versión del reporte. La revisión 1 es el original; las siguientes son cor
 | `generated_at`, `sent_at` | `timestamptz` | nullable | |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
 
-Cálculo de cambios (`diff_snapshots(previous, current)`), por pedido presente en la revisión anterior:
+Cálculo de cambios (`diff_snapshots(previous, current)`), por pedido publicado del día:
 
 | Antes | Ahora | Cambio |
 |-------|-------|--------|
+| (no estaba en la revisión anterior) | `assigned` a A o `cancelled` | `added` ("pedido agregado YV-0130 (tomado por Joel)"); típico de una apertura extra después del reporte |
 | `assigned` a A | `assigned` a B (B ≠ A) | `courier_changed` A → B ("pasó de Joel a Emiliano") |
 | `assigned` a A | `cancelled` | `cancelled` ("fue cancelado (estaba asignado a Joel)") |
 | `assigned` a A | `assigned` a A | Sin cambio (aunque haya habido liberación y nueva toma; RN-23) |
@@ -639,8 +643,9 @@ Validación determinística (`validate_schedule_intent`), antes de pedir confirm
 - `date` no puede ser pasada y, si es hoy, `end_time` debe ser posterior a la hora actual.
 - `closed_window` se recorta al horario efectivo del día; si queda vacía, es inválida.
 - `open_window` debe quedar entre `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del
-  día siguiente), debe agregar tiempo fuera del horario base (la parte que se superpone se ignora) y su día no puede
-  tener el reporte original ya generado (`daily_reports.current_revision = 0` y estado `waiting` o inexistente).
+  día siguiente) y debe agregar tiempo fuera del horario base (la parte que se superpone se ignora). Si el reporte
+  de ese día ya se envió, la apertura se permite igual: el resumen de confirmación lo advierte y, al confirmar, el
+  reporte se reabre (ver [03](03-estados-pedido.md)).
 - Horas ambiguas ("de 3 a 6") se interpretan dentro del horario base (15:00–18:00); el resumen de
   confirmación muestra siempre las horas en formato 24 h para que el administrador lo verifique.
 - `reopen` solo se propone si hay cierres en vigor; si no, se responde sin pedir confirmación.
