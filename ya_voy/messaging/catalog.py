@@ -137,8 +137,8 @@ TEMPLATES: dict[str, str] = {
         "Totales actualizados: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados. Este archivo reemplaza a la versión anterior."
     ),
     ADMIN_REPORT_PENDING_REMINDER: (
-        "⏳ {report_label} del {report_date} {ready_label}, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. "
-        "Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*."
+        "⏳ {report_label} del {report_date} {ready_label}, pero {report_pronoun} retengo porque quedan pedidos sin tomar: {pending_codes}. "
+        "Cuando estén tomados o cancelados te {report_pronoun} mando. Para cancelar uno: *cancelar {code}*."
     ),
     ADMIN_DAILY_REPORT_FAILED: (
         "❗ No pude generar o enviar el reporte del {report_date} (versión {revision}). Error: {error}."
@@ -202,8 +202,11 @@ SCHEDULE_INVALID_REASONS: dict[str, str] = {
 # Daily report (doc 07 "Alertas y reporte", "Textos de cambios"; sheets and columns from doc 05).
 REPORT_LABEL_INITIAL = "El reporte"
 REPORT_LABEL_CORRECTION = "La corrección del reporte"
+# {report_label} agreement (doc 07): "El reporte" is masculine, "La corrección del reporte" feminine.
 READY_LABEL_INITIAL = "está listo"
 READY_LABEL_CORRECTION = "está lista"
+REPORT_PRONOUN_INITIAL = "lo"
+REPORT_PRONOUN_CORRECTION = "la"
 SCHEDULE_NOTE = "\nCambios de horario: {items}"
 CHANGE_LINES: dict[str, str] = {
     "added": "• Pedido agregado *{code}* (tomado por {to_courier})",

@@ -29,6 +29,7 @@ Variables comunes:
 | `{revision}` | Número de versión del reporte (2 = primera corrección) |
 | `{report_label}` | "El reporte" o, si es la espera de una corrección por apertura extra, "La corrección del reporte" |
 | `{ready_label}` | Concuerda con `{report_label}`: "está listo" (El reporte) o "está lista" (La corrección del reporte) |
+| `{report_pronoun}` | Concuerda con `{report_label}`: "lo" (El reporte) o "la" (La corrección del reporte) |
 | `{changes_list}` | Cambios netos de una corrección, uno por línea (ver "Textos de cambios") |
 
 Bloque `{order_details}` (el mismo en el grupo, al motero y al local):
@@ -128,7 +129,7 @@ Los cierres y aperturas de horario no se anuncian en el grupo (RF-46).
 | `admin_order_unclaimed` | T15: `UNCLAIMED_ALERT_MINUTES` sin toma (una vez por período) | ⚠️ El pedido *{code}* lleva {minutes} minutos sin motero.<br/><br/>{order_details}<br/><br/>Sigue publicado. Si querés cancelarlo, escribí *cancelar {code}*. |
 | `admin_daily_report` | CU-16 (documento `.xlsx`; este es el pie) | 📊 Reporte del {report_date}: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados, {couriers_count} moteros con actividad.{schedule_note} |
 | `admin_daily_report_correction` | CU-17 (documento `.xlsx`; este es el pie) | 🛠️ *Corrección* del reporte del {report_date} (versión {revision}):<br/>{changes_list}<br/><br/>Totales actualizados: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados. Este archivo reemplaza a la versión anterior. |
-| `admin_report_pending_reminder` | CU-16 / CU-17: `REPORT_PENDING_REMINDER_MINUTES` después del cierre efectivo siguen pendientes (una vez por cierre efectivo: antes del primer envío y tras una apertura extra sobre un día ya reportado) | ⏳ {report_label} del {report_date} {ready_label}, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*. |
+| `admin_report_pending_reminder` | CU-16 / CU-17: `REPORT_PENDING_REMINDER_MINUTES` después del cierre efectivo siguen pendientes (una vez por cierre efectivo: antes del primer envío y tras una apertura extra sobre un día ya reportado) | ⏳ {report_label} del {report_date} {ready_label}, pero {report_pronoun} retengo porque quedan pedidos sin tomar: {pending_codes}. Cuando estén tomados o cancelados te {report_pronoun} mando. Para cancelar uno: *cancelar {code}*. |
 | `admin_daily_report_failed` | CU-16 / CU-17: se agotaron los intentos | ❗ No pude generar o enviar el reporte del {report_date} (versión {revision}). Error: {error}. |
 | `admin_rate_limited_sender` | CU-18: un remitente superó el límite (una vez por día y remitente) | ℹ️ {sender_name} mandó demasiados mensajes seguidos; los estoy ignorando por un rato. |
 | `admin_llm_failure` | CU-01: falla persistente del LLM | ❗ No pude procesar un mensaje de {store_name}: el servicio de lectura de pedidos no responde. |

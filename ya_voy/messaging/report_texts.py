@@ -84,6 +84,9 @@ def pending_reminder_variables(
         "ready_label": (
             catalog.READY_LABEL_CORRECTION if correction else catalog.READY_LABEL_INITIAL
         ),
+        "report_pronoun": (
+            catalog.REPORT_PRONOUN_CORRECTION if correction else catalog.REPORT_PRONOUN_INITIAL
+        ),
         "report_date": fmt_report_date(report_date),
         "pending_codes": ", ".join(codes),
         "code": codes[0],

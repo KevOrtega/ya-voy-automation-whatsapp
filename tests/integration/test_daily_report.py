@@ -749,9 +749,10 @@ async def test_opening_after_report_adds_orders_with_reminder(
     clock.now = at(10, 3)
     await report_jobs.process_report_corrections(ctx)
     [reminder, _] = await outbox(sf, "admin_report_pending_reminder")
-    assert reminder.body.startswith(
-        "⏳ La corrección del reporte del 09/10/2026 está lista, pero lo retengo porque quedan "
-        "pedidos sin tomar: YV-0132."
+    assert reminder.body == (
+        "⏳ La corrección del reporte del 09/10/2026 está lista, pero la retengo porque quedan "
+        "pedidos sin tomar: YV-0132. Cuando estén tomados o cancelados te la mando. Para "
+        "cancelar uno: *cancelar YV-0132*."
     )
     await world.claim(late, "Emiliano", at(10, 3, 5))
     clock.now = at(10, 3, 10)
