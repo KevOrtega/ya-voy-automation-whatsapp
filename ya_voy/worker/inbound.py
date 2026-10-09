@@ -120,15 +120,16 @@ async def process_inbound_event(ctx: dict[str, Any], inbound_event_id: int) -> s
                 )
                 return f"skipped:{row.status}"
             outcome, outbound_ids = await _process_locked(session, ctx, row)
-    except PayloadError as exc:
-        logger.warning("stored inbound payload is not parseable", extra=log_extra)
-        await _mark_failed(session_factory, inbound_event_id, f"PayloadError: {exc}")
-        return "failed"
     except Exception as exc:
-        logger.exception("inbound event processing failed", extra=log_extra)
-        # TODO(stage 4): retry policy for transient failures (LLM, DB); failed rows are kept
-        # for inspection and are not swept (docs/06 sweeps only `received`).
-        await _mark_failed(session_factory, inbound_event_id, f"{type(exc).__name__}: {exc}")
+        # Failed events are kept for inspection and are not swept (docs/06 sweeps only
+        # `received`); stage 4 adds a manual reprocess command. Always visible at ERROR.
+        error = f"{type(exc).__name__}: {exc}"[:ERROR_LIMIT]
+        logger.error(
+            "inbound event failed",
+            extra=log_extra | {"error": error},
+            exc_info=not isinstance(exc, PayloadError),
+        )
+        await _mark_failed(session_factory, inbound_event_id, error)
         return "failed"
 
     await enqueue_outbound_ids(ctx["redis"], outbound_ids)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -131,10 +132,21 @@ async def test_missing_event_is_skipped(worker_ctx: Ctx) -> None:
     assert await process_inbound_event(worker_ctx(), 999_999) == "skipped:missing"
 
 
+def _failure_records(caplog: pytest.LogCaptureFixture, event_id: int) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.ERROR
+        and r.name == "ya_voy.worker.inbound"
+        and getattr(r, "inbound_event_id", None) == event_id
+    ]
+
+
 async def test_processing_error_marks_failed_and_is_not_retried_by_redelivery(
     worker_ctx: Ctx,
     session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     def boom(*args: Any, **kw: Any) -> Any:
         raise RuntimeError("handler exploded")
@@ -146,11 +158,15 @@ async def test_processing_error_marks_failed_and_is_not_retried_by_redelivery(
     assert row.status == "failed"
     assert row.error == "RuntimeError: handler exploded"
     assert row.attempts == 1
+    (record,) = _failure_records(caplog, event_id)  # never a silent failure
+    assert record.error == "RuntimeError: handler exploded"
     assert await process_inbound_event(worker_ctx(), event_id) == "skipped:failed"
 
 
 async def test_unparseable_stored_payload_marks_failed(
-    worker_ctx: Ctx, session_factory: async_sessionmaker[AsyncSession]
+    worker_ctx: Ctx,
+    session_factory: async_sessionmaker[AsyncSession],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     event_id = await store_event(session_factory, load_fixture("private_text"))
     async with session_factory() as session, session.begin():
@@ -158,7 +174,10 @@ async def test_unparseable_stored_payload_marks_failed(
             update(InboundEvent).where(InboundEvent.id == event_id).values(payload={"x": 1})
         )
     assert await process_inbound_event(worker_ctx(), event_id) == "failed"
-    assert (await get_event(session_factory, event_id)).error.startswith("PayloadError")
+    error = (await get_event(session_factory, event_id)).error
+    assert error is not None and error.startswith("PayloadError")
+    (record,) = _failure_records(caplog, event_id)
+    assert record.error == error
 
 
 # --- per-sender rate limit (RF-05, CU-18) --------------------------------------------------
