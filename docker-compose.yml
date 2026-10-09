@@ -61,7 +61,8 @@ services:
       AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
       DEL_INSTANCE: "false"
       LANGUAGE: en
-      LOG_LEVEL: ERROR,WARN,INFO,LOG,WEBHOOKS
+      # No WEBHOOKS level: Evolution would log every delivery with the full webhook URL (secret).
+      LOG_LEVEL: ERROR,WARN,INFO,LOG
       DATABASE_PROVIDER: postgresql
       DATABASE_CONNECTION_URI: postgresql://yavoy:yavoy@postgres:5432/evolution?schema=evolution_api
       DATABASE_CONNECTION_CLIENT_NAME: evolution_yavoy
