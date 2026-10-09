@@ -4,7 +4,7 @@ COMPOSE ?= docker compose
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: help env venv up down logs ps test test-docker lint format migrate revision check-migrations replay reprocess shell-web psql redis-cli clean
+.PHONY: help env venv up down logs ps test test-docker lint format migrate revision check-migrations replay reprocess resend-report shell-web psql redis-cli clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -61,6 +61,9 @@ replay: ## POST Evolution fixtures to the running web twice: make replay f="test
 
 reprocess: ## Re-enqueue failed inbound events: make reprocess ids="12 15" (or ids=--all)
 	$(COMPOSE) exec worker python -m scripts.reprocess_inbound $(ids)
+
+resend-report: ## Resend failed daily reports: make resend-report date=2026-10-09 (or date=--all-failed)
+	$(COMPOSE) exec worker python -m scripts.resend_report $(date)
 
 shell-web: ## Open a shell in the web container
 	$(COMPOSE) exec web bash

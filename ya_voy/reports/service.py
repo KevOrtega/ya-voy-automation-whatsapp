@@ -18,6 +18,11 @@ is built:
 the revision is ``sent``, the revision is ``sent``, ``current_revision`` moves to it and a report
 still ``generating`` goes ``sent``. A report that a change moved to ``correction_pending``
 meanwhile stays so. Locks are always taken report row first, then revision row.
+
+A ``failed`` report is terminal for the crons. :func:`reopen_failed_report` (``make
+resend-report``) moves it back: with the file kept, the revision goes ``generated`` again and the
+documents are queued under new keys; without a file, the report goes back to the step machine
+(``waiting`` or ``correction_pending``) to be rebuilt. Every terminal failure is logged at ERROR.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import exists, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -294,13 +299,35 @@ async def store_file(
     rev.status = VS.GENERATED
     rev.generated_at = await _now(session)
     template_key, body = texts.caption(job.data)
+    return await _enqueue_documents(session, settings, report, rev, template_key, body)
+
+
+def document_key(report: DailyReport, rev: ReportRevision, phone: str) -> str:
+    """``daily_report:{D}:v{N}:{phone}``; each manual resend round K adds ``:r{K}``."""
+    resend = f":r{rev.resends}" if rev.resends else ""
+    return f"daily_report:{report.report_date}:v{rev.revision}{resend}:{phone}"
+
+
+async def _enqueue_documents(
+    session: AsyncSession,
+    settings: Settings,
+    report: DailyReport,
+    rev: ReportRevision,
+    template_key: str,
+    body: str,
+    *,
+    skip_jids: frozenset[str] = frozenset(),
+) -> list[int]:
     ids: list[int] = []
     for phone in settings.admin_phones:
+        jid = jid_for_phone(phone)
+        if jid in skip_jids:
+            continue
         new_id = await enqueue_outbound_message(
             session,
-            idempotency_key=f"daily_report:{report.report_date}:v{rev.revision}:{phone}",
+            idempotency_key=document_key(report, rev, phone),
             template_key=template_key,
-            recipient_jid=jid_for_phone(phone),
+            recipient_jid=jid,
             message_type=OutboundMessageType.DOCUMENT,
             body=body,
             report_revision_id=rev.id,
@@ -311,15 +338,20 @@ async def store_file(
 
 
 async def _fail_report(
-    session: AsyncSession, settings: Settings, report: DailyReport, revision: int, error: str
+    session: AsyncSession, settings: Settings, report: DailyReport, rev: ReportRevision, error: str
 ) -> list[int]:
+    """The report fails as a whole. The alert goes through WhatsApp, which may be what is down:
+    callers log the failure at ERROR first."""
     report.status = RS.FAILED
+    resend = f":r{rev.resends}" if rev.resends else ""
     return await enqueue_admin_alert(
         session,
         settings,
         template_key=catalog.ADMIN_DAILY_REPORT_FAILED,
-        idempotency_base=f"{catalog.ADMIN_DAILY_REPORT_FAILED}:{report.report_date}:v{revision}",
-        variables=texts.report_failed_variables(report.report_date, revision, error),
+        idempotency_base=(
+            f"{catalog.ADMIN_DAILY_REPORT_FAILED}:{report.report_date}:v{rev.revision}{resend}"
+        ),
+        variables=texts.report_failed_variables(report.report_date, rev.revision, error),
     )
 
 
@@ -332,15 +364,32 @@ async def fail_build(
         return []
     rev.status = VS.FAILED
     rev.last_error = f"{type(exc).__name__}: {exc}"[:ERROR_LIMIT]  # stored, never sent
-    logger.error(
-        "daily report build failed",
-        extra={"report_revision_id": rev.id, "attempts": rev.attempts},
-    )
+    extra = {
+        "report_date": str(report.report_date),
+        "revision": rev.revision,
+        "report_revision_id": rev.id,
+        "attempts": rev.attempts,
+        "error": rev.last_error,
+    }
     if rev.attempts < settings.daily_report_max_attempts:
+        logger.warning(
+            "daily report %s v%d: build attempt %d failed: %s",
+            report.report_date,
+            rev.revision,
+            rev.attempts,
+            rev.last_error,
+            extra=extra,
+        )
         return []
-    return await _fail_report(
-        session, settings, report, rev.revision, catalog.REPORT_ERROR_GENERATION
+    logger.error(
+        "daily report %s v%d FAILED: build failed after %d attempts: %s",
+        report.report_date,
+        rev.revision,
+        rev.attempts,
+        rev.last_error,
+        extra=extra,
     )
+    return await _fail_report(session, settings, report, rev, catalog.REPORT_ERROR_GENERATION)
 
 
 async def on_document_sent(session: AsyncSession, row: OutboundMessage) -> None:
@@ -350,23 +399,51 @@ async def on_document_sent(session: AsyncSession, row: OutboundMessage) -> None:
     report, rev = await _lock_revision_and_report(session, row.report_revision_id)
     if rev.status != VS.GENERATED:
         return
-    unsent = await session.scalar(
-        select(
-            exists().where(
-                OutboundMessage.report_revision_id == rev.id,
-                OutboundMessage.status != OutboundStatus.SENT,
+    await _complete_if_delivered(session, report, rev)
+
+
+async def _copies(session: AsyncSession, rev: ReportRevision) -> tuple[bool, set[str]]:
+    """Whether a copy of ``rev`` is still in the outbox (pending or sending), and the
+    recipients that already got it. Rows of earlier resend rounds count too."""
+    rows = (
+        await session.execute(
+            select(OutboundMessage.recipient_jid, OutboundMessage.status).where(
+                OutboundMessage.report_revision_id == rev.id
             )
         )
+    ).all()
+    in_outbox = any(st in (OutboundStatus.PENDING, OutboundStatus.SENDING) for _, st in rows)
+    return in_outbox, {jid for jid, st in rows if st == OutboundStatus.SENT}
+
+
+async def _complete_if_delivered(
+    session: AsyncSession, report: DailyReport, rev: ReportRevision
+) -> bool:
+    """The revision is ``sent`` once nothing is left in the outbox and every recipient got a
+    copy (in any round). After a manual resend the file may predate changes made while the
+    report was ``failed`` (they do not mark it): the report goes ``correction_pending`` so the
+    corrections cron compares once more (no changes → ``sent``)."""
+    in_outbox, delivered = await _copies(session, rev)
+    rows = await session.scalars(
+        select(OutboundMessage.recipient_jid)
+        .where(OutboundMessage.report_revision_id == rev.id)
+        .distinct()
     )
-    if unsent:
-        return
+    if in_outbox or not delivered or set(rows) - delivered:
+        return False
+    now = await _now(session)
     rev.status = VS.SENT
-    rev.sent_at = await _now(session)
+    rev.sent_at = now
     report.current_revision = max(report.current_revision, rev.revision)
     if report.status == RS.GENERATING:
-        report.status = RS.SENT
         report.reopened_by_override_id = None
-        report.correction_requested_at = None
+        if rev.resends:
+            report.status = RS.CORRECTION_PENDING
+            report.correction_requested_at = now
+        else:
+            report.status = RS.SENT
+            report.correction_requested_at = None
+    return True
 
 
 async def on_document_failed(
@@ -379,11 +456,28 @@ async def on_document_failed(
     if rev.status == VS.GENERATED:
         rev.status = VS.FAILED
         rev.last_error = row.last_error
-    error = catalog.REPORT_ERROR_DELIVERY.format(
-        recipient_name=await recipient_name(session, settings, row.recipient_jid),
-        attempts_text=catalog.attempts_text(row.attempts),
+    recipient = await recipient_name(session, settings, row.recipient_jid)
+    logger.error(
+        "daily report %s v%d FAILED: delivery to %s failed after %d attempt(s): %s",
+        report.report_date,
+        rev.revision,
+        recipient,
+        row.attempts,
+        row.last_error,
+        extra={
+            "report_date": str(report.report_date),
+            "revision": rev.revision,
+            "report_revision_id": rev.id,
+            "outbound_message_id": row.id,
+            "recipient": recipient,
+            "attempts": row.attempts,
+            "error": row.last_error,
+        },
     )
-    return await _fail_report(session, settings, report, rev.revision, error)
+    error = catalog.REPORT_ERROR_DELIVERY.format(
+        recipient_name=recipient, attempts_text=catalog.attempts_text(row.attempts)
+    )
+    return await _fail_report(session, settings, report, rev, error)
 
 
 # TODO(stage-8b): wire T13/T16/T17/T18 (release and cancel flows) to mark_report_for_correction.
@@ -411,7 +505,7 @@ async def mark_report_for_correction(session: AsyncSession, day: dt.date) -> boo
 
 
 # TODO(stage-8b): admin commands on reports need admin identity by number/@lid: report status
-# in `estado` and a manual retry of a `failed` report.
+# in `estado` and a WhatsApp command for the manual resend (today: `make resend-report`).
 async def report_dates(
     session: AsyncSession, settings: Settings, now: dt.datetime
 ) -> list[dt.date]:
@@ -465,3 +559,128 @@ async def run_step(
     async with session_factory() as session, session.begin():
         ids += await store_file(session, settings, job, content)
     return Outcome.STARTED, ids
+
+
+# --- manual resend of failed reports (docs/06 "Reenvío manual de reportes fallidos") ----------
+
+# TODO(stage-8b): resend automatically when a CONNECTION_UPDATE says the WhatsApp connection is
+# back (state "open"), instead of waiting for an operator.
+
+
+class ResendOutcome(StrEnum):
+    RESENT = "resent"  # file kept: the documents are queued again under new keys
+    REBUILD = "rebuild"  # no file: back to the step machine, rebuilt by the caller
+    NOT_FAILED = "not_failed"  # nothing to do (already resent, sent, in progress...)
+    NOT_FOUND = "not_found"
+
+
+async def failed_report_dates(session: AsyncSession) -> list[dt.date]:
+    rows = await session.scalars(
+        select(DailyReport.report_date)
+        .where(DailyReport.status == RS.FAILED)
+        .order_by(DailyReport.report_date)
+    )
+    return list(rows)
+
+
+async def _last_caption(session: AsyncSession, rev: ReportRevision) -> tuple[str, str] | None:
+    row = (
+        await session.execute(
+            select(OutboundMessage.template_key, OutboundMessage.body)
+            .where(OutboundMessage.report_revision_id == rev.id)
+            .order_by(OutboundMessage.id.desc())
+            .limit(1)
+        )
+    ).first()
+    return None if row is None else (row[0], row[1])
+
+
+async def reopen_failed_report(
+    session: AsyncSession, settings: Settings, day: dt.date
+) -> tuple[ResendOutcome, list[int]]:
+    """Move a ``failed`` report back to a resendable state. Call inside a short transaction.
+
+    The report row is locked ``FOR UPDATE`` (waiting, not skipping): a concurrent run waits and
+    then finds it no longer ``failed`` (``NOT_FAILED``), so two runs never resend twice.
+
+    - The latest unsent revision keeps its file: it goes ``generated`` again, ``resends + 1``,
+      and one document per admin that has not got a copy yet is queued under
+      ``daily_report:{D}:v{N}:r{K}:{phone}``. The report goes ``generating``.
+    - No file (the build failed, or retention removed it): ``attempts`` restarts at 0 and the
+      report goes ``waiting`` (never sent) or ``correction_pending``; the caller runs
+      :func:`run_step` to rebuild it now from current data (the crons would do it too).
+    """
+    report = await session.scalar(
+        select(DailyReport).where(DailyReport.report_date == day).with_for_update()
+    )
+    if report is None:
+        return ResendOutcome.NOT_FOUND, []
+    if report.status != RS.FAILED:
+        return ResendOutcome.NOT_FAILED, []
+    latest = await session.scalar(
+        select(ReportRevision)
+        .where(ReportRevision.daily_report_id == report.id)
+        .order_by(ReportRevision.revision.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    unsent = latest if latest is not None and latest.revision > report.current_revision else None
+    caption = await _last_caption(session, unsent) if unsent is not None else None
+    if unsent is not None:
+        unsent.resends += 1
+        unsent.last_error = None
+    if unsent is not None and unsent.file_content is not None and caption is not None:
+        unsent.status = VS.GENERATED
+        report.status = RS.GENERATING
+        report.last_checked_at = await _now(session)
+        in_outbox, delivered = await _copies(session, unsent)
+        ids = await _enqueue_documents(
+            session, settings, report, unsent, *caption, skip_jids=frozenset(delivered)
+        )
+        if not ids and not in_outbox:  # every admin already had it
+            await _complete_if_delivered(session, report, unsent)
+        logger.info(
+            "daily report %s v%d: resend %d queued",
+            day,
+            unsent.revision,
+            unsent.resends,
+            extra={"report_date": str(day), "revision": unsent.revision, "outbound_ids": ids},
+        )
+        return ResendOutcome.RESENT, ids
+    if unsent is not None:
+        unsent.status = VS.FAILED
+        unsent.attempts = 0
+    if report.current_revision == 0:
+        report.status = RS.WAITING
+    else:
+        report.status = RS.CORRECTION_PENDING
+        report.correction_requested_at = report.correction_requested_at or await _now(session)
+    logger.info("daily report %s: rebuild requested", day, extra={"report_date": str(day)})
+    return ResendOutcome.REBUILD, []
+
+
+async def resend_failed_reports(
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    days: list[dt.date] | None = None,
+    *,
+    builder: Builder = build_workbook,
+) -> tuple[dict[str, str], list[int]]:
+    """``make resend-report``: the given days, or every ``failed`` report when ``days`` is None.
+    Returns ``{date: outcome}`` and the outbox ids to enqueue."""
+    if days is None:
+        async with session_factory() as session:
+            days = await failed_report_dates(session)
+    outcomes: dict[str, str] = {}
+    ids: list[int] = []
+    for day in days:
+        async with session_factory() as session, session.begin():
+            outcome, new_ids = await reopen_failed_report(session, settings, day)
+        ids += new_ids
+        result = str(outcome)
+        if outcome == ResendOutcome.REBUILD:
+            step_outcome, step_ids = await run_step(session_factory, settings, day, builder=builder)
+            ids += step_ids
+            result = f"{outcome}:{step_outcome}"
+        outcomes[str(day)] = result
+    return outcomes, ids

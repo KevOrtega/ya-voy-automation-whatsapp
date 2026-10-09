@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 from collections.abc import Callable, Iterator
 from io import BytesIO
 from typing import Any
@@ -21,10 +22,12 @@ from openpyxl import load_workbook
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from scripts import resend_report
 from tests.integration import factories as f
-from tests.integration.conftest import EVOLUTION_URL
+from tests.integration.conftest import EVOLUTION_URL, queued, redis_test_url
 from tests.schedule_helpers import at
 from ya_voy.db import models as m
+from ya_voy.queue import SEND_OUTBOUND
 from ya_voy.reports import service
 from ya_voy.reports.service import Outcome
 from ya_voy.schedule import repository as schedule_repository
@@ -747,7 +750,7 @@ async def test_opening_after_report_adds_orders_with_reminder(
     await report_jobs.process_report_corrections(ctx)
     [reminder, _] = await outbox(sf, "admin_report_pending_reminder")
     assert reminder.body.startswith(
-        "⏳ La corrección del reporte del 09/10/2026 está listo, pero lo retengo porque quedan "
+        "⏳ La corrección del reporte del 09/10/2026 está lista, pero lo retengo porque quedan "
         "pedidos sin tomar: YV-0132."
     )
     await world.claim(late, "Emiliano", at(10, 3, 5))
@@ -1039,3 +1042,323 @@ async def test_mark_report_for_correction_only_after_a_send(
             await service.mark_report_for_correction(session, D)
         current = await report(session_factory)
         assert current is not None and current.status == expected, status
+
+
+# --- manual resend of failed reports (make resend-report) --------------------------------------
+
+D0 = D - dt.timedelta(days=1)
+
+
+def report_errors(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "ya_voy.reports.service" and r.levelno == logging.ERROR
+    ]
+
+
+async def failed_delivery(ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter) -> None:
+    """Revision 1 built; WhatsApp rejects both copies; the report is ``failed``."""
+    clock.now = at(9, 23)
+    assert await run(ctx) == Outcome.STARTED
+    evo["sendMedia"].side_effect = None
+    evo["sendMedia"].respond(400, json={"error": "disconnected"})
+    await deliver(ctx)
+    current = await report(ctx["session_factory"])
+    assert current is not None and current.status == "failed"
+
+
+def evolution_back(evo: respx.MockRouter) -> None:
+    evo["sendMedia"].respond(201, json={"key": {"id": "BAE5RESENT", "fromMe": True}})
+
+
+async def document_rows(sf: SF) -> list[m.OutboundMessage]:
+    return [r for r in await outbox(sf) if r.message_type == "document"]
+
+
+async def test_delivery_failure_is_logged_at_error_per_recipient(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        await failed_delivery(ctx, clock, evo)
+    errors = report_errors(caplog)
+    assert len(errors) == 2  # one per failed copy
+    for record in errors:
+        message = record.getMessage()
+        assert message.startswith(
+            "daily report 2026-10-09 v1 FAILED: delivery to un administrador failed after 1 "
+        )
+        assert "disconnected" in message
+        assert (record.report_date, record.revision, record.recipient) == (  # type: ignore[attr-defined]
+            "2026-10-09",
+            1,
+            "un administrador",
+        )
+        assert "disconnected" in record.error  # type: ignore[attr-defined]
+    assert {r.outbound_message_id for r in errors} == {  # type: ignore[attr-defined]
+        r.id for r in await document_rows(ctx["session_factory"])
+    }
+
+
+async def test_resend_after_delivery_failure_requeues_the_same_file(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter
+) -> None:
+    sf = ctx["session_factory"]
+    settings = ctx["settings"]
+    await failed_delivery(ctx, clock, evo)
+    [rev] = await revisions(sf)
+    original = rev.file_content
+    evolution_back(evo)
+    clock.now = at(10, 8)
+
+    outcomes, ids = await service.resend_failed_reports(sf, settings, [D])
+
+    assert outcomes == {"2026-10-09": "resent"}
+    assert len(ids) == 2
+    [rev] = await revisions(sf)
+    assert (rev.status, rev.resends, rev.attempts, rev.file_content) == (
+        "generated",
+        1,
+        1,
+        original,
+    )
+    current = await report(sf)
+    assert current is not None and current.status == "generating"
+    resent = [r for r in await document_rows(sf) if r.id in ids]
+    assert sorted(r.idempotency_key for r in resent) == [
+        f"daily_report:2026-10-09:v1:r1:{phone}" for phone in ADMINS
+    ]
+    assert {r.template_key for r in resent} == {"admin_daily_report"}
+
+    # Running it again does nothing: the report is no longer failed.
+    assert await service.resend_failed_reports(sf, settings, [D]) == (
+        {"2026-10-09": "not_failed"},
+        [],
+    )
+
+    await deliver(ctx)
+    [rev] = await revisions(sf)
+    assert rev.status == "sent"
+    current = await report(sf)
+    assert current is not None
+    # The file may predate changes made while it was failed: one more comparison.
+    assert (current.status, current.current_revision) == ("correction_pending", 1)
+    assert await report_jobs.process_report_corrections(ctx) == {"2026-10-09": "no_changes"}
+    current = await report(sf)
+    assert current is not None and current.status == "sent"
+    assert len(await revisions(sf)) == 1
+
+
+async def test_resend_skips_admins_that_already_got_the_file(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter
+) -> None:
+    sf = ctx["session_factory"]
+    clock.now = at(9, 23)
+    assert await run(ctx) == Outcome.STARTED
+    evo["sendMedia"].side_effect = [
+        httpx.Response(201, json={"key": {"id": "BAE5OK", "fromMe": True}}),
+        httpx.Response(400, json={"error": "disconnected"}),
+    ]
+    await deliver(ctx)
+    current = await report(sf)
+    assert current is not None and current.status == "failed"
+    evo["sendMedia"].side_effect = None
+    evolution_back(evo)
+
+    outcomes, ids = await service.resend_failed_reports(sf, ctx["settings"], [D])
+
+    assert outcomes == {"2026-10-09": "resent"}
+    [row] = [r for r in await document_rows(sf) if r.id in ids]
+    assert row.idempotency_key == f"daily_report:2026-10-09:v1:r1:{ADMINS[1]}"
+    await deliver(ctx)
+    [rev] = await revisions(sf)
+    assert rev.status == "sent"
+
+
+async def test_failed_resend_fails_again_with_a_new_alert(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter, caplog: pytest.LogCaptureFixture
+) -> None:
+    sf = ctx["session_factory"]
+    await failed_delivery(ctx, clock, evo)
+    await deliver(ctx)  # the first alerts
+    _, ids = await service.resend_failed_reports(sf, ctx["settings"], [D])
+    assert len(ids) == 2
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        await deliver(ctx)  # WhatsApp still down
+    assert len(report_errors(caplog)) == 2
+    current = await report(sf)
+    assert current is not None and current.status == "failed"
+    [rev] = await revisions(sf)
+    assert (rev.status, rev.resends) == ("failed", 1)
+    keys = sorted(r.idempotency_key for r in await outbox(sf, "admin_daily_report_failed"))
+    assert keys == sorted(
+        [f"admin_daily_report_failed:2026-10-09:v1:{p}" for p in ADMINS]
+        + [f"admin_daily_report_failed:2026-10-09:v1:r1:{p}" for p in ADMINS]
+    )
+    # A second resend round gets its own keys.
+    evolution_back(evo)
+    _, ids = await service.resend_failed_reports(sf, ctx["settings"], [D])
+    rows = [r for r in await document_rows(sf) if r.id in ids]
+    assert sorted(r.idempotency_key for r in rows) == [
+        f"daily_report:2026-10-09:v1:r2:{p}" for p in ADMINS
+    ]
+
+
+async def broken_build(ctx: dict[str, Any], day: dt.date = D) -> None:
+    def broken(data: Any, tz: Any) -> bytes:
+        raise OSError("disk full")
+
+    for _ in range(ctx["settings"].daily_report_max_attempts):
+        await service.run_step(ctx["session_factory"], ctx["settings"], day, builder=broken)
+    current = await report(ctx["session_factory"], day)
+    assert current is not None and current.status == "failed"
+
+
+async def test_build_failures_log_warnings_then_one_error(
+    ctx: dict[str, Any], clock: Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock.now = at(9, 23)
+    with caplog.at_level(logging.INFO):
+        await broken_build(ctx)
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == "ya_voy.reports.service" and r.levelno == logging.WARNING
+    ]
+    assert [r.getMessage() for r in warnings] == [
+        "daily report 2026-10-09 v1: build attempt 1 failed: OSError: disk full",
+        "daily report 2026-10-09 v1: build attempt 2 failed: OSError: disk full",
+    ]
+    [error] = report_errors(caplog)
+    assert error.getMessage() == (
+        "daily report 2026-10-09 v1 FAILED: build failed after 3 attempts: OSError: disk full"
+    )
+    assert (error.report_date, error.revision, error.error) == (  # type: ignore[attr-defined]
+        "2026-10-09",
+        1,
+        "OSError: disk full",
+    )
+
+
+async def test_resend_rebuilds_a_report_without_file(ctx: dict[str, Any], clock: Clock) -> None:
+    sf = ctx["session_factory"]
+    clock.now = at(9, 23)
+    await broken_build(ctx)
+    clock.now = at(10, 8)
+
+    outcomes, ids = await service.resend_failed_reports(sf, ctx["settings"], [D])
+
+    assert outcomes == {"2026-10-09": "rebuild:started"}
+    [rev] = await revisions(sf)
+    assert (rev.status, rev.attempts, rev.resends, rev.last_error) == ("generated", 1, 1, None)
+    assert rev.file_content is not None
+    rows = [r for r in await document_rows(sf) if r.id in ids]
+    assert sorted(r.idempotency_key for r in rows) == [
+        f"daily_report:2026-10-09:v1:r1:{p}" for p in ADMINS
+    ]
+    await deliver(ctx)
+    assert await report_jobs.process_report_corrections(ctx) == {"2026-10-09": "no_changes"}
+    current = await report(sf)
+    assert current is not None and (current.status, current.current_revision) == ("sent", 1)
+
+
+async def test_resend_rebuilds_a_failed_correction_with_current_data(
+    ctx: dict[str, Any], clock: Clock, world: World
+) -> None:
+    sf = ctx["session_factory"]
+    order_id = await world.order("YV-0123", "assigned", courier="Joel")
+    await sent_report(ctx, clock)
+    async with sf() as session, session.begin():
+        await world.release(session, order_id, "Joel")
+    await world.claim(order_id, "Emiliano", at(9, 23, 5))
+    clock.now = at(9, 23, 6)
+    await broken_build(ctx)
+    [_, rev2] = await revisions(sf)
+    assert (rev2.status, rev2.attempts) == ("failed", 3)
+
+    outcomes, ids = await service.resend_failed_reports(sf, ctx["settings"], [D])
+
+    assert outcomes == {"2026-10-09": "rebuild:started"}
+    assert len(ids) == 2
+    [_, rev2] = await revisions(sf)
+    assert (rev2.revision, rev2.status, rev2.attempts, rev2.resends) == (2, "generated", 1, 1)
+    assert rev2.changes == [
+        {"code": "YV-0123", "type": "courier_changed", "from": "Joel", "to": "Emiliano"}
+    ]
+
+
+async def test_resend_all_failed_and_nothing_to_do(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter, engine: AsyncEngine
+) -> None:
+    sf = ctx["session_factory"]
+    settings = ctx["settings"]
+    clock.now = at(9, 23)
+    await broken_build(ctx, D0)  # yesterday: build failed
+    await failed_delivery(ctx, clock, evo)  # today: delivery failed
+    await f.insert_ok(engine, f.daily_report(report_date=D1, status="sent"))  # untouched
+    evolution_back(evo)
+
+    outcomes, ids = await service.resend_failed_reports(sf, settings)
+
+    assert outcomes == {"2026-10-08": "rebuild:started", "2026-10-09": "resent"}
+    assert len(ids) == 4
+    sent_row = await report(sf, D1)
+    assert sent_row is not None and sent_row.status == "sent"
+    # Nothing left: a second run (single date, unknown date or all) does nothing.
+    assert await service.resend_failed_reports(sf, settings) == ({}, [])
+    assert await service.resend_failed_reports(sf, settings, [D, D1, D + dt.timedelta(9)]) == (
+        {"2026-10-09": "not_failed", "2026-10-10": "not_failed", "2026-10-18": "not_found"},
+        [],
+    )
+
+
+async def test_concurrent_resends_queue_one_round(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter
+) -> None:
+    sf = ctx["session_factory"]
+    await failed_delivery(ctx, clock, evo)
+    results = await asyncio.gather(
+        *(service.resend_failed_reports(sf, ctx["settings"], [D]) for _ in range(4))
+    )
+    assert sorted(o["2026-10-09"] for o, _ in results) == ["not_failed"] * 3 + ["resent"]
+    assert sum(len(ids) for _, ids in results) == 2
+    [rev] = await revisions(sf)
+    assert rev.resends == 1
+    assert len(await document_rows(sf)) == 4  # 2 originals + 1 round
+
+
+async def test_concurrent_rebuild_resends_build_once(ctx: dict[str, Any], clock: Clock) -> None:
+    sf = ctx["session_factory"]
+    clock.now = at(9, 23)
+    await broken_build(ctx)
+    results = await asyncio.gather(
+        *(service.resend_failed_reports(sf, ctx["settings"], [D]) for _ in range(4))
+    )
+    assert sum(len(ids) for _, ids in results) == 2
+    [rev] = await revisions(sf)
+    assert (rev.status, rev.attempts, rev.resends) == ("generated", 1, 1)
+    assert len(await document_rows(sf)) == 2
+
+
+async def test_resend_script_queues_the_documents(
+    ctx: dict[str, Any], clock: Clock, evo: respx.MockRouter, database_url: str
+) -> None:
+    await failed_delivery(ctx, clock, evo)
+    settings = ctx["settings"].model_copy(
+        update={"database_url": database_url, "redis_url": redis_test_url()}
+    )
+
+    outcomes, ids = await resend_report.run(settings, [D], all_failed=False)
+    assert outcomes == {"2026-10-09": "resent"}
+    assert len(ids) == 2
+    jobs = await queued(ctx["redis"], SEND_OUTBOUND)
+    assert {args[0] for _, args in jobs} >= set(ids)
+
+    assert await resend_report.run(settings, None, all_failed=True) == ({}, [])
+
+
+def test_resend_script_needs_dates_or_all_failed() -> None:
+    for argv in ([], ["2026-10-09", "--all-failed"], ["09/10/2026"]):
+        with pytest.raises(SystemExit):
+            resend_report.main(argv)
