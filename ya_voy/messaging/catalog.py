@@ -36,8 +36,88 @@ ADMIN_DAILY_REPORT = "admin_daily_report"
 ADMIN_DAILY_REPORT_CORRECTION = "admin_daily_report_correction"
 ADMIN_REPORT_PENDING_REMINDER = "admin_report_pending_reminder"
 ADMIN_DAILY_REPORT_FAILED = "admin_daily_report_failed"
+STORE_ORDER_PUBLISHED = "store_order_published"
+STORE_ORDER_NOT_SENT_CLOSED = "store_order_not_sent_closed"
+STORE_ORDER_ASSIGNED = "store_order_assigned"
+STORE_ORDER_UNASSIGNED = "store_order_unassigned"
+STORE_ORDER_CANCELLED = "store_order_cancelled"
+STORE_ORDER_CANCELLED_BY_ADMIN = "store_order_cancelled_by_admin"
+STORE_DRAFT_CANCELLED = "store_draft_cancelled"
+STORE_CANCEL_AMBIGUOUS = "store_cancel_ambiguous"
+STORE_ORDER_NOT_FOUND = "store_order_not_found"
+STORE_CANCEL_NOT_ALLOWED = "store_cancel_not_allowed"
+STORE_CANCEL_NOTHING_ACTIVE = "store_cancel_nothing_active"  # proposed in stage 5a/6a
+GROUP_ORDER_POST = "group_order_post"
+GROUP_ORDER_ASSIGNED = "group_order_assigned"
+GROUP_ORDER_UNASSIGNED = "group_order_unassigned"
+GROUP_ORDER_DELETE = "group_order_delete"
+COURIER_ORDER_ASSIGNED = "courier_order_assigned"
+COURIER_ORDER_ALREADY_TAKEN = "courier_order_already_taken"
+COURIER_ORDER_RELEASED = "courier_order_released"
+COURIER_ORDER_RELEASED_BY_ADMIN = "courier_order_released_by_admin"
+COURIER_ORDER_CANCELLED = "courier_order_cancelled"
+COURIER_ORDER_NO_LONGER_AVAILABLE = "courier_order_no_longer_available"
+ADMIN_ORDER_UNCLAIMED = "admin_order_unclaimed"
+ADMIN_COMMAND_OK = "admin_command_ok"
+ADMIN_COMMAND_ERROR = "admin_command_error"
 
 TEMPLATES: dict[str, str] = {
+    STORE_ORDER_PUBLISHED: (
+        "✅ Pedido *{code}* enviado a los moteros. Te aviso cuando uno lo tome.\n\n"
+        "Para cancelarlo, respondé este mensaje con *cancelar*."
+    ),
+    STORE_ORDER_NOT_SENT_CLOSED: (
+        "🚫 No envié tu pedido porque en este momento no estamos tomando pedidos{reason_text}. "
+        "Mandalo de nuevo cuando volvamos a tomar pedidos."
+    ),
+    STORE_ORDER_ASSIGNED: "🏍️ Tu motero para el pedido *{code}* será *{courier_name}*.",
+    STORE_ORDER_UNASSIGNED: (
+        "⚠️ {courier_name} liberó tu pedido *{code}*. Ya está disponible de nuevo para los moteros."
+    ),
+    STORE_ORDER_CANCELLED: (
+        "❌ Pedido *{code}* cancelado. Ya lo saqué del grupo de moteros.{courier_note}"
+    ),
+    STORE_ORDER_CANCELLED_BY_ADMIN: "❌ La administración canceló tu pedido *{code}*.{courier_note}",
+    STORE_DRAFT_CANCELLED: "Listo, descarté el pedido; no se envió a los moteros.",
+    STORE_CANCEL_AMBIGUOUS: (
+        "Tenés varios pedidos activos: {active_codes}. Respondé *cancelar* citando el mensaje del "
+        "pedido o escribí *cancelar* y el código, por ejemplo *cancelar {code}*."
+    ),
+    STORE_ORDER_NOT_FOUND: (
+        "No encontré un pedido activo con ese código. Tus pedidos activos: {active_codes}."
+    ),
+    STORE_CANCEL_NOT_ALLOWED: "El pedido *{code}* ya está {status_label} y no se puede cancelar.",
+    # Proposed in stage 5a/6a, pending the client's approval (doc 07).
+    STORE_CANCEL_NOTHING_ACTIVE: "No tenés pedidos activos para cancelar.",
+    GROUP_ORDER_POST: (
+        "🆕 *Pedido {code}*\n\n{order_details}\n\n👉 *Reaccioná a este mensaje para tomarlo.*"
+    ),
+    GROUP_ORDER_ASSIGNED: "✅ *{code}* asignado a *{courier_name}*.",
+    GROUP_ORDER_UNASSIGNED: (
+        "🔓 *{code}* vuelve a estar disponible. Reaccioná de nuevo para tomarlo "
+        "(si ya habías reaccionado, cambiá el emoji)."
+    ),
+    GROUP_ORDER_DELETE: "",
+    COURIER_ORDER_ASSIGNED: (
+        "✅ *Te asignamos el pedido {code}*\n\n{order_details}\n\n"
+        "Si no podés hacerlo, quitá tu reacción en el grupo para liberarlo."
+    ),
+    COURIER_ORDER_ALREADY_TAKEN: "El pedido *{code}* ya lo tomó otro motero. ¡Gracias igual!",
+    COURIER_ORDER_RELEASED: "Liberaste el pedido *{code}*; ya no está a tu nombre.",
+    COURIER_ORDER_RELEASED_BY_ADMIN: (
+        "La administración liberó el pedido *{code}*; ya no está a tu nombre."
+    ),
+    COURIER_ORDER_CANCELLED: (
+        "❌ Tu pedido *{code}* ha sido cancelado:\n\n{order_details}\n\n"
+        "No hace falta que lo retires. Si ya lo retiraste, devolvelo en el local."
+    ),
+    COURIER_ORDER_NO_LONGER_AVAILABLE: "El pedido *{code}* fue cancelado y ya no está disponible.",
+    ADMIN_ORDER_UNCLAIMED: (
+        "⚠️ El pedido *{code}* lleva {minutes} minutos sin motero.\n\n{order_details}\n\n"
+        "Sigue publicado. Si querés cancelarlo, escribí *cancelar {code}*."
+    ),
+    ADMIN_COMMAND_OK: "✅ Listo: *{code}* {action_label}.{courier_note}",
+    ADMIN_COMMAND_ERROR: "No pude {action_verb} *{code}*: {reason}.",
     ADMIN_RATE_LIMITED_SENDER: (
         "ℹ️ {sender_name} mandó demasiados mensajes seguidos; los estoy ignorando por un rato."
     ),
@@ -245,6 +325,26 @@ NOT_IN_PREVIOUS_VERSION = "No estaba"
 TAKEN_BY = "Tomado por {courier}"
 REPORT_ERROR_GENERATION = "no pude armar el archivo"
 REPORT_ERROR_DELIVERY = "no se pudo enviar el archivo a {recipient_name} tras {attempts_text}"
+
+# Order texts (doc 07).
+STATUS_LABELS: dict[str, str] = {"cancelled": "cancelado", "expired": "vencido"}
+STORE_COURIER_NOTE = "\nYa le avisé a {courier_name}."  # store_order_cancelled(_by_admin)
+ADMIN_COURIER_NOTE = " Le avisé a {courier_name}."  # admin_command_ok after cancelling
+ACTION_LABELS: dict[str, str] = {
+    "cancel": "cancelado y eliminado del grupo",
+    "release": "liberado",
+}
+ACTION_VERBS: dict[str, str] = {"cancel": "cancelar", "release": "liberar"}
+NOT_SENT_OUTSIDE_HOURS = " (horario de hoy: {effective_hours})"  # store_order_not_sent_closed
+
+# Proposed in stage 5a/6a, pending the client's approval (doc 07 "Propuestas de la etapa 5a/6a").
+ACTIVE_CODES_SEPARATOR = ", "
+NO_ACTIVE_CODES = "ninguno"
+COMMAND_ERROR_REASONS: dict[str, str] = {
+    "not_found": "no existe un pedido con ese código",
+    "already": "ya está {status_label}",
+    "not_assigned": "no está asignado a ningún motero",
+}
 
 # Readable field names for {missing_list} (doc 07).
 FIELD_LABELS: dict[str, str] = {

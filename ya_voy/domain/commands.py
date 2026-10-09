@@ -1,7 +1,7 @@
 """Store commands recognized by code, never by the LLM (CU-01 5a, CU-03 step 1, D-05).
 
-Only the recognition lives here; what each command does is stage 4b (confirm/publish) and
-stage 5 (cancel by code or quote).
+Only the recognition lives here; what each command does is in ``ya_voy.orders.store_commands``
+(stage 5a/6a).
 """
 
 from __future__ import annotations
@@ -48,6 +48,16 @@ def parse_store_command(text: str | None) -> StoreCommand | None:
     if _CANCEL_RE.match(normalized):
         return StoreCommand.CANCEL
     return None
+
+
+def store_cancel_code(text: str | None) -> str | None:
+    """The code in ``cancelar YV-0042`` (upper case), or ``None`` for a bare ``cancelar``."""
+    if not text:
+        return None
+    match = _CANCEL_RE.match(_normalize(text))
+    if match is None or match.group(1) is None:
+        return None
+    return match.group(1).strip().upper()
 
 
 class AdminCommand(StrEnum):
