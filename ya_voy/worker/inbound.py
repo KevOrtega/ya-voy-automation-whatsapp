@@ -76,8 +76,12 @@ async def _process_locked(
     if route is Route.UNHANDLED:
         row.status = InboundEventStatus.IGNORED
     else:
-        # TODO(stage 4+): call the handler for `route` here, inside this transaction, and
-        # collect the outbound ids it inserts.
+        # TODO(stage-4b): classify the sender (ya_voy/identity: admin / courier / store,
+        # auto-registration, @lid). For a store and Route.PRIVATE_TEXT call
+        #   drafts.handle_store_text(ctx, session, intake.StoreText(store_id=..., text=...,
+        #       inbound_event_id=row.id, wa_message_id=..., quoted_wa_message_id=...))
+        # and, after the commit, drafts.after_commit(ctx, result). PRIVATE_NON_TEXT ->
+        # store_unsupported_media. Group reactions are stage 5.
         row.status = InboundEventStatus.PROCESSED
     row.processed_at = now
     return str(route), outbound_ids

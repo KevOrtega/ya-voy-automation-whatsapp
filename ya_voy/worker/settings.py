@@ -11,10 +11,13 @@ from arq.cron import CronJob
 
 from ya_voy.config import get_settings
 from ya_voy.db.session import create_engine, create_session_factory
+from ya_voy.llm.factory import LLMConfigError, build_order_extractor
+from ya_voy.llm.unavailable import UnavailableOrderExtractor
 from ya_voy.logging import configure_logging
 from ya_voy.queue import redis_settings_from_url
 from ya_voy.whatsapp.client import EvolutionClient
 from ya_voy.worker import jobs
+from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import send_outbound
 from ya_voy.worker.sweeps import recover_inbound_events, recover_outbound_messages
@@ -41,6 +44,7 @@ def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
     return [
         cron(recover_inbound_events, run_at_startup=True, **schedule),
         cron(recover_outbound_messages, run_at_startup=True, **schedule),
+        cron(expire_drafts, run_at_startup=True, **schedule),
     ]
 
 
@@ -52,10 +56,19 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["engine"] = engine
     ctx["session_factory"] = create_session_factory(engine)
     ctx["evolution"] = EvolutionClient.from_settings(settings)
+    try:
+        ctx["order_extractor"] = build_order_extractor(settings)
+    except LLMConfigError as exc:
+        # Keep the worker up: extraction then fails like an outage (CU-01 6a).
+        logger.error("LLM not configured", extra={"error": str(exc)})
+        ctx["order_extractor"] = UnavailableOrderExtractor(str(exc))
     logger.info("worker started", extra={"app_env": settings.app_env})
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
+    extractor = ctx.get("order_extractor")
+    if hasattr(extractor, "aclose"):
+        await extractor.aclose()
     evolution = ctx.get("evolution")
     if evolution is not None:
         await evolution.aclose()
@@ -66,8 +79,13 @@ async def on_shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions: ClassVar[list[Any]] = [jobs.ping, process_inbound_event, send_outbound]
-    # TODO(stage 4+): the business crons (draft expiry, unclaimed alert, reports, retention).
+    functions: ClassVar[list[Any]] = [
+        jobs.ping,
+        process_inbound_event,
+        send_outbound,
+        evaluate_draft,
+    ]
+    # TODO(stage 5+): unclaimed alert, schedule reminders, reports, retention.
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown

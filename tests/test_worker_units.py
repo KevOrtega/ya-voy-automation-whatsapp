@@ -10,6 +10,7 @@ from tests.evolution_fixtures import COURIERS_GROUP_JID, load_fixture
 from ya_voy.messaging import catalog
 from ya_voy.whatsapp.payloads import parse_webhook
 from ya_voy.worker import WorkerSettings
+from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import backoff_delay, send_outbound
 from ya_voy.worker.ratelimit import window_key
@@ -50,8 +51,9 @@ def test_only_private_routes_are_rate_limited() -> None:
 def test_worker_registers_stage_3_jobs_and_sweeps() -> None:
     assert process_inbound_event in WorkerSettings.functions
     assert send_outbound in WorkerSettings.functions
+    assert evaluate_draft in WorkerSettings.functions
     names = {job.coroutine for job in WorkerSettings.cron_jobs}
-    assert names == {recover_inbound_events, recover_outbound_messages}
+    assert names == {recover_inbound_events, recover_outbound_messages, expire_drafts}
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 PROCESS_INBOUND_EVENT = "process_inbound_event"
 SEND_OUTBOUND = "send_outbound"
+EVALUATE_DRAFT = "evaluate_draft"
 
 
 def redis_settings_from_url(url: str) -> RedisSettings:
@@ -29,6 +30,11 @@ async def enqueue_send_outbound(
     redis: ArqRedis, outbound_message_id: int, *, defer_by: timedelta | None = None
 ) -> None:
     await redis.enqueue_job(SEND_OUTBOUND, outbound_message_id, _defer_by=defer_by)
+
+
+async def enqueue_evaluate_draft(redis: ArqRedis, order_id: int, *, defer_by: timedelta) -> None:
+    """RF-15: one deferred evaluation per store message; stale ones see a newer message and skip."""
+    await redis.enqueue_job(EVALUATE_DRAFT, order_id, _defer_by=defer_by)
 
 
 async def enqueue_outbound_ids(redis: ArqRedis, outbound_message_ids: Iterable[int]) -> None:
