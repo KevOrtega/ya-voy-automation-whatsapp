@@ -6,6 +6,10 @@ import pytest
 
 from ya_voy.config import Settings
 
+# Snapshot taken at import, before `clean_env` strips settings variables for each test.
+# Integration tests read DATABASE_URL / REDIS_URL / RUN_INTEGRATION from here.
+ORIGINAL_ENV = dict(os.environ)
+
 # Keep the developer's shell environment out of the tests: every Settings field maps to an
 # upper-case env var with the same name.
 _SETTINGS_ENV_VARS = {name.upper() for name in Settings.model_fields}

@@ -14,8 +14,9 @@ from ya_voy.db.base import Base
 
 config = context.config
 
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Programmatic callers (tests) keep their own logging setup.
+if config.config_file_name is not None and config.attributes.get("configure_logging", True):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Callers (e.g. tests) may pass an explicit URL via config.attributes; otherwise DATABASE_URL.
 database_url = config.attributes.get("database_url") or get_settings().database_url

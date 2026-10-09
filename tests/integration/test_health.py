@@ -5,21 +5,11 @@ Run inside Docker: ``make test-docker`` (sets RUN_INTEGRATION=1). Skipped otherw
 
 from __future__ import annotations
 
-import os
-
 import httpx
-import pytest
 
+from tests.conftest import ORIGINAL_ENV as _ENV
 from ya_voy.api.main import create_app
 from ya_voy.config import Settings
-
-# Captured at import time, before the autouse ``clean_env`` fixture strips settings env vars.
-_ENV = dict(os.environ)
-
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(_ENV.get("RUN_INTEGRATION") != "1", reason="set RUN_INTEGRATION=1"),
-]
 
 
 def _real_settings() -> Settings:
