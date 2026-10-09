@@ -3,7 +3,9 @@
 WhatsApp automation for a delivery dispatcher. Stores send orders to a bot number over
 WhatsApp; the bot validates them, publishes complete orders to a couriers' WhatsApp group,
 and lets couriers claim an order by reacting to its message. Stores and couriers are
-auto-registered from WhatsApp, and the admin receives alerts and a daily `.xlsx` report.
+auto-registered from WhatsApp. The admin can close or reopen order intake in natural
+language (with confirmation), receives alerts, and gets a daily `.xlsx` report once all of
+the day's orders are resolved. There is no delivery tracking: an order is done once claimed.
 
 > Status: **design phase**. This repository currently contains only the system analysis
 > and design documents. No application code yet.

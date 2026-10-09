@@ -6,6 +6,7 @@ Participantes comunes:
 - **API**: servicio FastAPI (`web`); solo recibe webhooks y encola.
 - **Q**: cola arq sobre Redis.
 - **W**: worker arq (lógica de negocio, envíos y tareas programadas).
+- **AD**: administrador (número en `ADMIN_PHONES`).
 - **DB**: PostgreSQL.
 - **LLM**: proveedor de LLM para extracción estructurada.
 
@@ -40,11 +41,11 @@ sequenceDiagram
     W->>DB: ¿remitente en ADMIN_PHONES o en couriers?
     DB-->>W: no
     W->>DB: INSERT stores (wa_jid, phone, display_name = pushName) ON CONFLICT DO UPDATE
-    W->>W: is_within_business_hours(now, TZ)
-    alt fuera de horario
-        W->>DB: INSERT messages, INSERT outbound_messages (store_out_of_hours) si no hubo uno reciente
+    W->>DB: is_accepting_orders(now): horario base en TZ menos schedule_overrides activos
+    alt fuera del horario efectivo
+        W->>DB: INSERT messages, INSERT outbound_messages (store_out_of_hours o store_closed_*) si no hubo uno reciente
         W->>EVO: sendText al local
-    else dentro de horario
+    else dentro del horario efectivo
         W->>Q: acquire lock store:{store_id}
         W->>DB: SELECT draft FOR UPDATE, INSERT orders (status = 'draft') si no existe
         W->>DB: INSERT messages (direction = 'in')
@@ -219,7 +220,7 @@ sequenceDiagram
     CR->>EVO: store_order_cancelled_by_admin, group_order_cancelled, admin_command_ok
 ```
 
-## 5. Reporte diario
+## 5. Reporte diario (con espera de pedidos pendientes)
 
 ```mermaid
 sequenceDiagram
@@ -230,29 +231,98 @@ sequenceDiagram
     participant EVO as Evolution API
     actor AD as Administrador
 
-    loop cada SCHEDULER_INTERVAL_SECONDS
-        CR->>CR: now en TZ mayor o igual a DAILY_REPORT_TIME
-        CR->>DB: INSERT daily_reports (report_date, status = 'generating') ON CONFLICT (report_date) DO NOTHING RETURNING id
-        alt ya existía (enviado o en curso)
-            DB-->>CR: (sin filas), reintenta solo si status = 'failed'
-        else nuevo
-            DB-->>CR: id
-            CR->>DB: eventos de la jornada (order_events + couriers) para Resumen
-            CR->>DB: pedidos publicados en la jornada (orders + stores + couriers) para Pedidos
-            CR->>X: build_daily_report(summary_rows, order_rows)
-            X-->>CR: bytes del .xlsx
-            CR->>DB: UPDATE daily_reports SET file_content, status = 'generated'
-            CR->>DB: INSERT outbound_messages (admin_daily_report, document) por cada ADMIN_PHONES, idempotency_key daily_report:fecha:phone
-        end
-    end
+    Note over CR: Desde DAILY_REPORT_TIME (23:00) de la fecha D,<br/>cada SCHEDULER_INTERVAL_SECONDS
+    CR->>DB: INSERT daily_reports (report_date = D, status = 'waiting') ON CONFLICT DO NOTHING
+    CR->>DB: SELECT daily_reports WHERE report_date = D AND status = 'waiting' FOR UPDATE SKIP LOCKED
+    CR->>DB: SELECT count, codes FROM orders WHERE fecha local de created_at = D AND status IN ('draft', 'published')
 
-    CR->>EVO: POST /message/sendMedia (mediatype document, fileName reporte-ya-voy-AAAA-MM-DD.xlsx)
-    EVO->>AD: documento + "Reporte de la jornada"
-    EVO-->>CR: key.id
-    CR->>DB: UPDATE outbound_messages SET status = 'sent', UPDATE daily_reports SET status = 'sent', sent_at
+    alt hay pedidos pendientes
+        CR->>DB: UPDATE daily_reports SET pending_orders_count, last_checked_at
+        opt ya pasó REPORT_PENDING_REMINDER_TIME (01:00 de D+1) y pending_reminder_sent_at IS NULL
+            CR->>DB: UPDATE daily_reports SET pending_reminder_sent_at = now()
+            CR->>EVO: admin_report_pending_reminder (códigos pendientes)
+            EVO->>AD: "El reporte del 09/10 espera: YV-0057, YV-0058 sin tomar"
+        end
+        Note over CR,AD: El administrador toma o cancela los pendientes.<br/>La próxima verificación vuelve a evaluar
+    else sin pendientes
+        CR->>DB: UPDATE daily_reports SET status = 'generating'
+        CR->>DB: Resumen: order_events de los pedidos de D agrupados por courier_id
+        CR->>DB: Pedidos: orders de D + stores + couriers
+        CR->>X: build_daily_report(summary_rows, order_rows)
+        X-->>CR: bytes del .xlsx
+        CR->>DB: UPDATE daily_reports SET file_content, status = 'generated'
+        CR->>DB: INSERT outbound_messages (admin_daily_report, document) por cada ADMIN_PHONES, idempotency_key daily_report:D:phone
+        CR->>EVO: POST /message/sendMedia (document, reporte-ya-voy-AAAA-MM-DD.xlsx)
+        EVO->>AD: documento + "Reporte del 09/10"
+        EVO-->>CR: key.id
+        CR->>DB: UPDATE outbound_messages SET status = 'sent', UPDATE daily_reports SET status = 'sent', sent_at
+    end
 ```
 
-## 6. Envío de mensajes salientes (bandeja de salida)
+## 6. Cambio de horario por el administrador (con confirmación)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor AD as Administrador
+    participant EVO as Evolution API
+    participant W as Worker
+    participant LLM as LLM
+    participant DB as PostgreSQL
+    actor S as Local
+
+    Note over AD,S: Las llamadas al webhook y la cola se omiten por claridad
+
+    AD->>EVO: "hoy no tomamos pedidos por lluvia"
+    EVO->>W: mensaje privado de un número de ADMIN_PHONES
+    W->>W: ¿es comando (cancelar, liberar, estado, horario, ayuda) o respuesta sí/no? No
+    W->>LLM: parse_schedule(text, now en TZ, horario base) -> ScheduleOverrideIntent
+    LLM-->>W: kind = closed_today, reason = "lluvia"
+    W->>W: validate_schedule_intent() y calcular starts_at = now, ends_at = 24:00 local
+    rect rgb(235, 245, 255)
+        Note over W,DB: Una transacción
+        W->>DB: UPDATE schedule_overrides SET status = 'superseded' WHERE created_by = AD AND status = 'pending_confirmation'
+        W->>DB: INSERT schedule_overrides (status = 'pending_confirmation', confirmation_expires_at = now + 5 min)
+        W->>DB: INSERT outbound_messages (admin_schedule_confirm)
+    end
+    W->>EVO: sendText al administrador
+    EVO->>AD: "Entendí esto: hoy 09/10 no se toman pedidos (motivo: lluvia). ¿Lo aplico? Respondé sí o no"
+
+    alt responde "sí" a tiempo
+        AD->>EVO: "sí"
+        EVO->>W: mensaje privado
+        W->>DB: UPDATE schedule_overrides SET status = 'active', confirmed_at WHERE status = 'pending_confirmation' AND confirmation_expires_at > now()
+        DB-->>W: 1 fila
+        W->>EVO: admin_schedule_applied
+        EVO->>AD: "Listo. Hoy no se toman más pedidos (motivo: lluvia)"
+    else responde "no"
+        AD->>EVO: "no"
+        W->>DB: UPDATE status = 'rejected'
+        W->>EVO: admin_schedule_rejected
+    else no responde
+        W->>DB: (cron) UPDATE status = 'expired' WHERE confirmation_expires_at < now()
+    end
+
+    S->>EVO: "Dirección de retiro: ..."
+    EVO->>W: mensaje de local
+    W->>DB: is_accepting_orders(now) devuelve cierre closed_today, reason lluvia
+    W->>EVO: store_closed_today (si no se le respondió hace poco)
+    EVO->>S: "Hoy no tomamos pedidos por lluvia."
+
+    AD->>EVO: "ya tomamos pedidos de nuevo"
+    W->>LLM: parse_schedule(...)
+    LLM-->>W: kind = reopen
+    W->>DB: INSERT schedule_overrides (kind = reopen, pending_confirmation)
+    W->>EVO: admin_schedule_confirm ("Vuelvo a tomar pedidos ahora. Se levanta: cierre de hoy por lluvia")
+    AD->>EVO: "sí"
+    rect rgb(235, 245, 255)
+        W->>DB: UPDATE reopen SET status = 'applied', confirmed_at
+        W->>DB: UPDATE schedule_overrides SET status = 'cancelled', cancelled_at, cancelled_by_override_id WHERE status = 'active' AND en vigor ahora
+    end
+    W->>EVO: admin_schedule_applied
+```
+
+## 7. Envío de mensajes salientes (bandeja de salida)
 
 Todos los envíos siguen el mismo patrón, que no se repite en los diagramas anteriores:
 

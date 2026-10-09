@@ -6,7 +6,7 @@
 flowchart TB
     store(["👤 Local<br/>Envía pedidos por WhatsApp"])
     courier(["👤 Motero<br/>Toma pedidos reaccionando en el grupo"])
-    admin(["👤 Administrador<br/>Recibe alertas y el reporte diario,<br/>interviene pedidos con comandos"])
+    admin(["👤 Administrador<br/>Recibe alertas y el reporte diario,<br/>interviene pedidos y cambia el horario del día"])
 
     yavoy["<b>Ya Voy</b><br/>Sistema de despacho de pedidos por WhatsApp"]
 
@@ -14,10 +14,10 @@ flowchart TB
     llm["Proveedor de LLM<br/>Extracción estructurada"]
 
     store -- "mensajes privados" --> wa
-    courier -- "reacciones en el grupo,<br/>comandos por privado" --> wa
-    admin -- "comandos por privado" --> wa
+    courier -- "reacciones en el grupo" --> wa
+    admin -- "comandos y cambios de horario<br/>por privado, reacciones en el grupo" --> wa
     wa <-- "eventos y envíos<br/>(protocolo de WhatsApp Web)" --> yavoy
-    yavoy -- "HTTPS: texto a OrderExtraction" --> llm
+    yavoy -- "HTTPS: texto a OrderExtraction<br/>o ScheduleOverrideIntent" --> llm
     wa -- "alertas y reporte .xlsx" --> admin
 ```
 
@@ -55,7 +55,7 @@ flowchart TB
 | Contenedor | Tecnología | Responsabilidad | No hace |
 |------------|-----------|-----------------|---------|
 | `web` | FastAPI + Uvicorn, SQLAlchemy 2 (async) + asyncpg | Validar el secreto del webhook, descartar lo obviamente irrelevante (`fromMe`, otros grupos, estados), insertar en `inbound_events`, encolar, responder rápido. `/health`. | Llamar al LLM o a Evolution. No expone API de administración. |
-| `worker` | arq, openpyxl | `process_inbound_event`, `evaluate_draft`, `send_outbound`; tareas cron: vencimiento de borradores, alerta de pedidos sin tomar, recordatorio de entrega, reporte diario, retención y barridos de recuperación. | Exponer HTTP. |
+| `worker` | arq, openpyxl | `process_inbound_event`, `evaluate_draft`, `send_outbound`; tareas cron: vencimiento de borradores, alerta de pedidos sin tomar, vencimiento de confirmaciones de horario, recordatorio de cierre vigente, reporte diario (con espera de pendientes), retención y barridos de recuperación. | Exponer HTTP. |
 | `postgres` | PostgreSQL 16 | Fuente de verdad. Dos bases: `yavoy` (aplicación) y `evolution` (interna de Evolution). | — |
 | `redis` | Redis 7 | Cola de arq, lock por local, lock del límite de envío, contadores de límite por remitente, caché de Evolution (con prefijo propio). | Guardar estado de negocio. |
 | `evolution` | Evolution API v2 | Mantener la sesión de WhatsApp (QR), entregar eventos por webhook, enviar textos y documentos. | Lógica de negocio. |
@@ -70,8 +70,9 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 |-------|-----------|--------|
 | `expire_drafts` | `draft` con `draft_expires_at < now()` | T05 |
 | `alert_unclaimed_orders` | `published`, sin alerta, `unclaimed_alert_at < now()` | T12 |
-| `remind_pending_deliveries` | `assigned` hace más de `DELIVERY_REMINDER_MINUTES`, sin recordatorio | T18 |
-| `send_daily_report` | Hora local ≥ `DAILY_REPORT_TIME` y no hay `daily_reports` enviado para hoy | CU-14 |
+| `expire_schedule_confirmations` | `schedule_overrides` en `pending_confirmation` con `confirmation_expires_at < now()` | Pasan a `expired` |
+| `remind_still_closed` | Hora local ≥ `BUSINESS_HOURS_START`, hay un `closed_until_further_notice` activo y no se avisó hoy | `admin_schedule_still_closed` |
+| `process_daily_reports` | Hora local ≥ `DAILY_REPORT_TIME` para hoy, o fechas anteriores en `waiting`/`failed` | CU-15: espera pendientes, recordatorio de `REPORT_PENDING_REMINDER_TIME`, genera y envía |
 | `recover_inbound_events` | `inbound_events` en `received` con más de `INBOUND_RECOVERY_SECONDS` | Reencolar |
 | `recover_outbound_messages` | `outbound_messages` en `pending` antiguos | Reencolar |
 | `apply_data_retention` | Una vez por día | Anonimizar lo más viejo que `DATA_RETENTION_DAYS` |
@@ -82,9 +83,10 @@ lugar de depender de ejecutarse en un minuto exacto, así que si el worker estuv
 ya_voy/
   api/            # FastAPI app, routers: webhooks, health
   worker/         # arq WorkerSettings, job functions, scheduled tasks
-  domain/         # order state machine, validation, command parsing, business hours (pure code, no I/O)
+  domain/         # order state machine, validation, command parsing (pure code, no I/O)
+  schedule/       # base hours + schedule_overrides, is_accepting_orders, override validation and confirmation flow
   identity/       # sender classification, store/courier auto-registration, lid/phone resolution and merge
-  extraction/     # LLM client interface + OrderExtraction schema + prompt + payment normalization
+  llm/            # provider-agnostic client; OrderExtractor and ScheduleIntentParser with their schemas and prompts
   whatsapp/       # Evolution API client, webhook payload parsing (jid/lid helpers)
   messaging/      # templates catalog, outbox enqueue/render
   reports/        # daily report queries and xlsx builder (openpyxl)
@@ -93,13 +95,19 @@ ya_voy/
 ```
 
 - **`domain`** no depende de FastAPI, arq ni Evolution: recibe eventos normalizados
-  (`StoreTextReceived`, `ReactionAdded`, `ReactionRemoved`, `CourierCommandReceived`,
-  `AdminCommandReceived`, ...) y decide transiciones. Es lo que más se testea.
+  (`StoreTextReceived`, `ReactionAdded`, `ReactionRemoved`, `CourierTextReceived`,
+  `AdminCommandReceived`, `AdminScheduleTextReceived`, `AdminConfirmationReceived`, ...) y decide transiciones.
+  Es lo que más se testea.
+- **`schedule`** concentra el horario: `is_accepting_orders(now)` (horario base menos cierres activos, con el
+  motivo del cierre), la validación de `ScheduleOverrideIntent`, el cálculo de `starts_at`/`ends_at` y el ciclo de
+  confirmación. Es código puro salvo la lectura de `schedule_overrides`.
 - **`identity`** clasifica al remitente (admin, motero, local) y hace el alta automática. Concentra todo
   lo que depende de cómo WhatsApp expone `@lid` y números, que es lo más cambiante.
-- **`extraction`** define `OrderExtractor.extract(text, current) -> OrderExtraction`. La implementación
-  concreta usa un cliente compatible con varios proveedores (por ejemplo `pydantic-ai`, `instructor` o
-  `litellm`; se elige al implementar). Proveedor y modelo por configuración (RNF-13).
+- **`llm`** define dos interfaces: `OrderExtractor.extract(text, current) -> OrderExtraction` y
+  `ScheduleIntentParser.parse(text, now, base_hours) -> ScheduleOverrideIntent`. La implementación concreta usa
+  un cliente compatible con varios proveedores (por ejemplo `pydantic-ai`, `instructor` o `litellm`; se elige al
+  implementar). Proveedor y modelo por configuración (RNF-13). El LLM nunca decide: su salida se valida con
+  código y, en el caso del horario, además la confirma el administrador.
 - **`whatsapp`** encapsula el formato de Evolution: normaliza números, JID y `@lid` (incluidos los campos
   alternativos), detecta reacciones (`message.reactionMessage`, con `text` vacío = remoción) y mensajes
   citados (`contextInfo.stanzaId`).
@@ -117,8 +125,11 @@ ya_voy/
 | D-05 | LLM solo para extracción; validación, comandos y horario en código | Respuestas predecibles, testeables y sin costo de LLM para comandos. |
 | D-06 | Postgres compartido (dos bases) en desarrollo; servicios separados en producción | Simplicidad local; aislamiento en producción. |
 | D-07 | Identidad por id de WhatsApp (JID o `@lid`), con número opcional | WhatsApp oculta cada vez más el número en grupos; el alta automática no puede depender de él. |
-| D-08 | Administración solo por comandos de WhatsApp | El administrador ya vive en WhatsApp; evita construir y asegurar un panel en v1. |
+| D-08 | Administración solo por WhatsApp (comandos y lenguaje natural) | El administrador ya vive en WhatsApp; evita construir y asegurar un panel en v1. |
 | D-09 | Tareas programadas por comparación con la hora actual y registros de idempotencia | Funcionan aunque el worker se reinicie; el reporte no se duplica ni se pierde. |
+| D-10 | Cambios de horario: LLM interpreta, código valida, administrador confirma | Comodidad del lenguaje natural sin aplicar nunca una mala interpretación sin aprobación. |
+| D-11 | Sin seguimiento de entrega; el pedido se cuenta al tomarse | Decisión del cliente; simplifica estados, mensajes y reporte. |
+| D-12 | El reporte espera a que no haya pedidos pendientes de la fecha | Los conteos del reporte son definitivos al enviarse. |
 
 ## 3. Entorno de desarrollo (Docker Compose)
 
@@ -139,7 +150,8 @@ Notas:
 - Evolution llama al webhook por la red interna de Compose: `http://web:8000/webhooks/evolution/<secret>`.
 - La instancia de WhatsApp se crea y vincula escaneando el QR desde el manager de Evolution (`http://localhost:8080/manager`) con un número de pruebas, **nunca** el número de producción del cliente. Se arma un grupo de prueba que hace de grupo de moteros.
 - Para probar sin teléfono se prevén fixtures con payloads reales de Evolution (texto, reacción, remoción de reacción, cita, participante `@lid` con y sin número alternativo, documento enviado) y un comando para reenviarlos al webhook.
-- Para probar horario y reporte se puede fijar la hora con una variable de desarrollo (`FAKE_NOW`) o con `BUSINESS_HOURS_*` y `DAILY_REPORT_TIME` cercanos a la hora actual.
+- Para probar horario, cierres y reporte se puede fijar la hora con una variable de desarrollo (`FAKE_NOW`) o con `BUSINESS_HOURS_*`, `DAILY_REPORT_TIME` y `REPORT_PENDING_REMINDER_TIME` cercanos a la hora actual.
+- La interpretación de horario tiene su propio conjunto de frases de prueba (los ejemplos del [modelo de datos](05-modelo-datos.md) y variantes).
 - Se usa el mismo `Dockerfile` para `web`, `worker` y `migrate`, que es el que Dokku construirá en producción.
 
 ## 4. Producción en Dokku (mapeo)
@@ -174,7 +186,7 @@ Consideraciones:
 
 - **Red interna:** Evolution y `yavoy` se conectan a una red de Dokku compartida (`dokku network:create yavoy-net` y `network:set ... attach-post-create`), así el webhook va a `http://yavoy.web:5000/...` y el worker llama a Evolution sin salir a internet. El manager de Evolution se expone con dominio propio, HTTPS (`dokku-letsencrypt`) y `AUTHENTICATION_API_KEY`.
 - **`DATABASE_URL`:** Dokku la inyecta como `postgres://...`; la configuración la convierte a `postgresql+asyncpg://...`.
-- **Zona horaria:** `TZ` se configura en la app (`dokku config:set yavoy TZ=America/Argentina/Buenos_Aires`); la aplicación igual calcula horario y jornada con `zoneinfo` a partir de `TZ`, sin depender del reloj del VPS.
+- **Zona horaria:** `TZ` se configura en la app (`dokku config:set yavoy TZ=America/Argentina/Buenos_Aires`); la aplicación igual calcula horario, cierres y fecha del reporte con `zoneinfo` a partir de `TZ`, sin depender del reloj del VPS.
 - **Escalado:** un solo proceso `worker` alcanza al inicio; las garantías de corrección están en Postgres, así que se puede escalar sin cambios.
 - **Backups:** `dokku postgres:backup-schedule` para ambas bases. La carpeta de instancias de Evolution contiene la sesión de WhatsApp: perderla obliga a escanear el QR de nuevo.
 
@@ -186,9 +198,12 @@ Consideraciones:
 | R-02 | Sin registro previo, cualquiera que conozca el número puede cargar pedidos que llegan al grupo. | Límite por remitente, bloqueo manual (`is_blocked`), nombre del local visible en el grupo y en el reporte, alerta al admin ante abuso. |
 | R-03 | Moteros conocidos solo por `@lid`: el reporte no tiene su teléfono y el envío de privados a un `@lid` depende de la versión de Baileys/Evolution. | Guardar el número cuando el evento lo trae (`participantAlt`, `senderPn`, etc.); verificar con eventos reales el envío a `@lid`; si un privado falla, `admin_outbound_failed` y el grupo igual muestra "Asignado a". |
 | R-04 | La misma persona vista una vez por `@lid` y otra por número genera dos moteros. | Fusión automática cuando un evento trae ambos identificadores (ver [modelo de datos](05-modelo-datos.md)). |
-| R-05 | Un motero que nunca reaccionó escribe `entregado` por privado y se lo trata como local. | No tiene pedidos asignados, así que no hay efecto dañino; el mensaje se registra. Se revisa con PA-02. |
-| R-06 | El administrador escribe desde un chat que WhatsApp expone solo como `@lid` y no se lo reconoce como admin. | Comparar también contra el número alternativo del evento; verificar con su número real al armar el entorno; agregar `ADMIN_JIDS` si hiciera falta. |
-| R-07 | Pedidos publicados cerca del cierre quedan sin tomar después de las 23:00. | La alerta al administrador funciona a cualquier hora (RF-08). |
+| R-05 | Un motero que nunca reaccionó en el grupo escribe por privado y se lo trata como local. | Si manda un pedido, se publica como de un local más; el nombre visible lo delata. Se corrige solo cuando reacciona por primera vez (pasa a ser motero conocido). |
+| R-06 | El administrador escribe desde un chat que WhatsApp expone solo como `@lid` y no se lo reconoce como admin: sus comandos y cambios de horario se tratarían como pedidos de un local. | Comparar también contra el número alternativo del evento; verificar con su número real al armar el entorno; agregar `ADMIN_JIDS` si hiciera falta. |
+| R-07 | Pedidos publicados cerca del cierre quedan sin tomar después de las 23:00 y retienen el reporte. | Alerta de pedido sin tomar a los 20 minutos y recordatorio a la 01:00 con los códigos; el administrador puede cancelarlos o tomarlos él. |
+| R-08 | El LLM interpreta mal una instrucción de horario (fecha u horas equivocadas). | Validación determinística, resumen explícito con fecha y horas en 24 h, confirmación obligatoria y vencimiento de la solicitud. |
+| R-09 | El administrador olvida un cierre "hasta nuevo aviso" y el servicio queda cerrado. | Recordatorio diario al comenzar el horario base (`admin_schedule_still_closed`) y comando `estado`. |
+| R-10 | Un pedido de un día ya reportado se cancela o se libera después del envío. | Queda en la auditoría; el reporte enviado no se corrige (PA-04). |
 
 ## 6. Variables de entorno
 
@@ -198,7 +213,7 @@ Consideraciones:
 |----------|-------------------|-------------|
 | `APP_ENV` | `development` | `development` \| `production`. |
 | `LOG_LEVEL` | `INFO` | |
-| `TZ` | `America/Argentina/Buenos_Aires` | Zona para horario de operación, jornada del reporte y horas mostradas. |
+| `TZ` | `America/Argentina/Buenos_Aires` | Zona para horario, cierres, fecha del reporte y horas mostradas. |
 | `DATABASE_URL` | `postgresql+asyncpg://yavoy:yavoy@postgres:5432/yavoy` | Inyectada por Dokku en producción. |
 | `REDIS_URL` | `redis://redis:6379/0` | Inyectada por Dokku en producción. |
 | `EVOLUTION_BASE_URL` | `http://evolution:8080` | |
@@ -206,7 +221,7 @@ Consideraciones:
 | `EVOLUTION_INSTANCE` | `yavoy` | Nombre de la instancia. |
 | `WEBHOOK_SECRET` | — | Secreto en la ruta del webhook. |
 | `COURIERS_GROUP_JID` | `1203630xxxxxxxx@g.us` | Grupo de moteros; cualquier otro grupo se ignora. |
-| `ADMIN_PHONES` | `5491100000000` | Número(s) del administrador, separados por coma: alertas, reporte y comandos. |
+| `ADMIN_PHONES` | `5491100000000` | Número(s) del administrador, separados por coma: alertas, reporte, comandos y cambios de horario. |
 | `LLM_PROVIDER` | `openai` | Proveedor de LLM. |
 | `LLM_MODEL` | — | Modelo para extracción. |
 | `LLM_API_KEY` | — | |
@@ -214,17 +229,17 @@ Consideraciones:
 | `LLM_TIMEOUT_SECONDS` | `20` | |
 | `LLM_MAX_RETRIES` | `3` | |
 | `ORDER_CODE_PREFIX` | `YV-` | |
-| `BUSINESS_HOURS_START` | `09:00` | Inicio del horario de operación (en `TZ`). |
-| `BUSINESS_HOURS_END` | `23:00` | Fin del horario de operación (en `TZ`). |
+| `BUSINESS_HOURS_START` | `09:00` | Inicio del horario base (en `TZ`). |
+| `BUSINESS_HOURS_END` | `23:00` | Fin del horario base (en `TZ`). Los cierres del administrador se restan de este horario. |
+| `SCHEDULE_CONFIRMATION_TTL_MINUTES` | `5` | Plazo para confirmar un cambio de horario. |
 | `OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES` | `30` | Mínimo entre respuestas "fuera de horario" al mismo local. |
 | `DRAFT_TTL_MINUTES` | `30` | Vencimiento del borrador por inactividad. |
 | `DRAFT_DEBOUNCE_SECONDS` | `8` | Intervalo de agrupación de mensajes. |
 | `MAX_MISSING_FIELDS_PROMPTS` | `2` | Tras cuántos pedidos de datos se agrega el ejemplo de formato. |
 | `UNCLAIMED_ALERT_MINUTES` | `20` | Minutos sin toma antes de alertar al administrador (una vez). |
 | `NOTIFY_LOSER_ON_RACE` | `true` | Avisar "ya lo tomó otro". |
-| `ANNOUNCE_DELIVERED_IN_GROUP` | `false` | Anunciar entregas en el grupo. |
-| `DELIVERY_REMINDER_MINUTES` | `90` | Recordatorio al motero y alerta al admin. |
-| `DAILY_REPORT_TIME` | `23:00` | Hora del reporte diario y fin de la jornada (en `TZ`). |
+| `DAILY_REPORT_TIME` | `23:00` | Desde esta hora se prepara el reporte del día (en `TZ`); se envía cuando no quedan pedidos pendientes. |
+| `REPORT_PENDING_REMINDER_TIME` | `01:00` | Si a esta hora (del día siguiente) el reporte sigue retenido, se recuerda al administrador. |
 | `DAILY_REPORT_MAX_ATTEMPTS` | `3` | |
 | `STORE_FALLBACK_NAME` | `Local` | Nombre si el local no tiene `pushName`. |
 | `COURIER_FALLBACK_NAME` | `Motero` | Nombre si el motero no tiene `pushName`. |
