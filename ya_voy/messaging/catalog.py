@@ -32,6 +32,10 @@ ADMIN_SCHEDULE_INVALID = "admin_schedule_invalid"
 ADMIN_SCHEDULE_PARSE_ERROR = "admin_schedule_parse_error"
 ADMIN_SCHEDULE_NOTHING_TO_REOPEN = "admin_schedule_nothing_to_reopen"
 ADMIN_SCHEDULE_STILL_CLOSED = "admin_schedule_still_closed"
+ADMIN_DAILY_REPORT = "admin_daily_report"
+ADMIN_DAILY_REPORT_CORRECTION = "admin_daily_report_correction"
+ADMIN_REPORT_PENDING_REMINDER = "admin_report_pending_reminder"
+ADMIN_DAILY_REPORT_FAILED = "admin_daily_report_failed"
 
 TEMPLATES: dict[str, str] = {
     ADMIN_RATE_LIMITED_SENDER: (
@@ -125,6 +129,20 @@ TEMPLATES: dict[str, str] = {
         "🔒 Recordatorio: la toma de pedidos sigue cerrada hasta nuevo aviso{reason_text} "
         "(desde el {since}). Para reabrir, escribí _ya tomamos pedidos de nuevo_."
     ),
+    ADMIN_DAILY_REPORT: (
+        "📊 Reporte del {report_date}: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados, {couriers_count} moteros con actividad.{schedule_note}"
+    ),
+    ADMIN_DAILY_REPORT_CORRECTION: (
+        "🛠️ *Corrección* del reporte del {report_date} (versión {revision}):\n{changes_list}\n\n"
+        "Totales actualizados: {orders_count} pedidos publicados, {assigned_count} tomados, {cancelled_count} cancelados. Este archivo reemplaza a la versión anterior."
+    ),
+    ADMIN_REPORT_PENDING_REMINDER: (
+        "⏳ {report_label} del {report_date} está listo, pero lo retengo porque quedan pedidos sin tomar: {pending_codes}. "
+        "Cuando estén tomados o cancelados te lo mando. Para cancelar uno: *cancelar {code}*."
+    ),
+    ADMIN_DAILY_REPORT_FAILED: (
+        "❗ No pude generar o enviar el reporte del {report_date} (versión {revision}). Error: {error}."
+    ),
 }
 
 # Schedule summaries ({override_summary}, doc 07 "Resúmenes de horario"), by kind.
@@ -180,6 +198,48 @@ SCHEDULE_INVALID_REASONS: dict[str, str] = {
     "already_over": "ese horario ya terminó",
     "closure_outside_hours": "en ese horario ya no se toman pedidos",
 }
+
+# Daily report (doc 07 "Alertas y reporte", "Textos de cambios"; sheets and columns from doc 05).
+REPORT_LABEL_INITIAL = "El reporte"
+REPORT_LABEL_CORRECTION = "La corrección del reporte"
+SCHEDULE_NOTE = "\nCambios de horario: {items}"
+CHANGE_LINES: dict[str, str] = {
+    "added": "• Pedido agregado *{code}* (tomado por {to_courier})",
+    "added_cancelled": "• Pedido agregado *{code}* (cancelado)",
+    "courier_changed": "• El pedido *{code}* pasó de {from_courier} a {to_courier}.",
+    "cancelled": "• El pedido *{code}* fue cancelado (estaba asignado a {from_courier}).",
+}
+SHEET_SUMMARY = "Resumen"
+SHEET_ORDERS = "Pedidos"
+SHEET_CORRECTIONS = "Correcciones"
+SUMMARY_HEADERS = ("Motero", "Teléfono", "Tomados", "Liberados", "Cancelados")
+ORDERS_HEADERS = (
+    "Código",
+    "Creado",
+    "Asignado",
+    "Local",
+    "Retiro",
+    "Entrega",
+    "Producto",
+    "Medio de pago",
+    "Motero",
+    "Estado",
+)
+ORDERS_CHANGE_HEADER = "Cambio"
+CORRECTIONS_HEADERS = ("Código", "Antes", "Ahora", "Detalle")
+ORDER_STATUS_LABELS: dict[str, str] = {"assigned": "Tomado", "cancelled": "Cancelado"}
+CORRECTION_BANNER = "CORRECCIÓN — versión {revision}"
+
+# Proposed in stage 8a, pending the client's approval (doc 07 "Propuestas de la etapa 8a").
+CHANGE_LABELS: dict[str, str] = {
+    "added": "Agregado",
+    "courier_changed": "Cambió de motero",
+    "cancelled": "Cancelado",
+}
+NOT_IN_PREVIOUS_VERSION = "No estaba"
+TAKEN_BY = "Tomado por {courier}"
+REPORT_ERROR_GENERATION = "no pude armar el archivo"
+REPORT_ERROR_DELIVERY = "no se pudo enviar el archivo a {recipient_name} tras {attempts_text}"
 
 # Readable field names for {missing_list} (doc 07).
 FIELD_LABELS: dict[str, str] = {
