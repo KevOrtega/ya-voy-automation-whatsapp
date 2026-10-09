@@ -9,17 +9,18 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from ya_voy.config import get_settings
+from ya_voy.db import models  # noqa: F401  (registers every table on Base.metadata)
 from ya_voy.db.base import Base
-
-# Import model modules here (stage 2) so their tables are registered on Base.metadata.
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# Callers (e.g. tests) may pass an explicit URL via config.attributes; otherwise DATABASE_URL.
+database_url = config.attributes.get("database_url") or get_settings().database_url
 # Escape '%' so ConfigParser interpolation doesn't choke on URL-encoded passwords.
-config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
