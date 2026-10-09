@@ -44,14 +44,13 @@ async def recover_inbound_events(ctx: dict[str, Any]) -> int:
 
 
 async def recover_outbound_messages(ctx: dict[str, Any]) -> int:
-    """``pending`` outbox rows older than ``INBOUND_RECOVERY_SECONDS`` -> ``send_outbound``.
+    """``pending`` outbox rows older than ``OUTBOUND_RECOVERY_SECONDS`` -> ``send_outbound``.
 
-    docs/06 says "pending antiguos" without a threshold; the inbound one is reused. Rows waiting
-    for a backoff are re-enqueued too, but ``send_outbound`` defers them again.
+    Rows waiting for a backoff are re-enqueued too, but ``send_outbound`` defers them again.
     """
     settings: Settings = ctx["settings"]
     session_factory: async_sessionmaker[AsyncSession] = ctx["session_factory"]
-    cutoff = func.now() - timedelta(seconds=settings.inbound_recovery_seconds)
+    cutoff = func.now() - timedelta(seconds=settings.outbound_recovery_seconds)
     async with session_factory() as session:
         ids = (
             await session.scalars(

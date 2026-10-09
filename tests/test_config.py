@@ -120,3 +120,11 @@ def test_capture_mode_is_refused_in_production() -> None:
             evolution_api_key="k",
             capture_inbound_payloads=True,
         )
+
+
+def test_outbound_recovery_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert make_settings().outbound_recovery_seconds == 60
+    monkeypatch.setenv("OUTBOUND_RECOVERY_SECONDS", "120")
+    assert make_settings().outbound_recovery_seconds == 120
+    with pytest.raises(ValidationError):
+        make_settings(outbound_recovery_seconds=0)

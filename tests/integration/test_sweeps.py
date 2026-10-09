@@ -53,7 +53,10 @@ async def test_recover_outbound_messages_only_old_pending(
     for row_id in (old, old_sent, old_failed):
         await _age(engine, OutboundMessage, "created_at", row_id, 120)
 
-    assert await recover_outbound_messages(worker_ctx(inbound_recovery_seconds=60)) == 1
+    # The outbox uses its own threshold (OUTBOUND_RECOVERY_SECONDS), not the inbound one.
+    assert await recover_outbound_messages(worker_ctx(outbound_recovery_seconds=300)) == 0
+    ctx = worker_ctx(inbound_recovery_seconds=300, outbound_recovery_seconds=60)
+    assert await recover_outbound_messages(ctx) == 1
     assert await queued(arq_redis) == [("send_outbound", (old,))]
 
 

@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     # Worker / scheduler / outbox
     scheduler_interval_seconds: int = Field(30, gt=0)
     inbound_recovery_seconds: int = Field(60, gt=0)
+    outbound_recovery_seconds: int = Field(60, gt=0)
     outbound_min_interval_ms: int = Field(1000, ge=0)
     outbound_max_attempts: int = Field(5, gt=0)
     data_retention_days: int = Field(90, gt=0)
