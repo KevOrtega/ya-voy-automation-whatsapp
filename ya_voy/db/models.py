@@ -366,6 +366,7 @@ class ReportRevision(Base):
     file_name: Mapped[str | None] = mapped_column(Text)
     file_content: Mapped[bytes | None] = mapped_column(LargeBinary)
     attempts: Mapped[int] = _int0()
+    resends: Mapped[int] = _int0()
     last_error: Mapped[str | None] = mapped_column(Text)
     generated_at: Mapped[dt.datetime | None] = _ts()
     sent_at: Mapped[dt.datetime | None] = _ts()
