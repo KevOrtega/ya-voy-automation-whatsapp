@@ -326,7 +326,7 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 **Flujo principal**
 
-1. Llega un mensaje de un local (no comando) y `is_accepting_orders(now)` es falso: está fuera del horario base (y de toda apertura extra) o hay un cierre activo.
+1. Llega un mensaje de un local (no comando) y `is_accepting_orders(now)` es falso: está fuera del horario base (y de toda apertura extra) o hay un cierre activo que no tapa una apertura confirmada después (RN-25).
 2. Se guarda en `messages`, sin llamar al LLM ni crear o modificar borradores.
 3. Si no se le respondió en los últimos `OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES`, se envía la plantilla que corresponde al motivo:
    - fuera del horario efectivo sin cierre del administrador → `store_out_of_hours` (con el horario de hoy, incluidas las aperturas);
@@ -339,7 +339,7 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 - **1a. El mensaje es `cancelar ...`:** se procesa normalmente (CU-09).
 - **1b. El mensaje es `sí` para un pedido en `awaiting_confirmation`:** CU-03 flujo 2a.
-- **3a. Hay varios cierres superpuestos:** se usa el de mayor alcance (`closed_until_further_notice` > `closed_today` > `closed_window`).
+- **3a. Hay varios cierres superpuestos:** entre los que cierran en ese momento (confirmados después de toda apertura en vigor, RN-25), se usa el de mayor alcance (`closed_until_further_notice` > `closed_today` > `closed_window`).
 - El alta automática del local (CU-01 paso 3) sí ocurre fuera de horario, para conservar su nombre e historial.
 
 ---
@@ -424,7 +424,7 @@ WhatsApp envía el cambio de emoji como un evento de reacción nuevo con el emoj
 
 - **1a. El LLM indica que no es una instrucción de horario** (`kind` nulo): se responde `admin_help`.
 - **1b. El LLM falla:** `admin_schedule_parse_error`; no se cambia nada.
-- **2a. Validación fallida** (ventana en el pasado, inicio posterior al fin, cierre totalmente fuera del horario efectivo, apertura totalmente dentro del horario base o fuera de los límites `SCHEDULE_EARLIEST_OPEN_TIME`–`SCHEDULE_LATEST_CLOSE_TIME`): `admin_schedule_invalid` con el motivo; no se crea solicitud.
+- **2a. Validación fallida** (ventana en el pasado, inicio posterior al fin, cierre totalmente fuera del horario efectivo, apertura que no agrega tiempo abierto desde ahora (ya está todo dentro del horario efectivo) o fuera de los límites `SCHEDULE_EARLIEST_OPEN_TIME`–`SCHEDULE_LATEST_CLOSE_TIME`): `admin_schedule_invalid` con el motivo; no se crea solicitud.
 - **2b. `reopen` sin cierres en vigor:** `admin_schedule_nothing_to_reopen`, sin pedir confirmación.
 - **6a. El administrador responde "no":** `status = 'rejected'`, `admin_schedule_rejected`.
 - **6b. Responde "sí" con la solicitud vencida:** `admin_schedule_confirmation_expired`; no se aplica.

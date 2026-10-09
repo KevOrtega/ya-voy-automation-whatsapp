@@ -230,6 +230,9 @@ apruebe o los cambie:
 | `{accepting_label}` fuera de horario | cerrado (fuera de horario) |
 | `{accepting_label}` con un cierre sin motivo | cerrado |
 | `{date}` en los resúmenes y `{since}` | `dd/mm/aaaa`, como en el ejemplo de `open_window` |
+| Al final de `{override_summary}` cuando la instrucción nueva reemplaza otras en la superposición (RN-25: gana la más reciente) | Reemplaza, en el horario que se superpone: {items}. |
+| Elemento de `{items}` para una apertura (los cierres usan los elementos de `{closures_list}`) | apertura del {date} de {window_start} a {window_end}{reason_text} |
+| Ejemplo completo (apertura después de un cierre por lluvia) | El 09/10/2026 se toman pedidos también de 19:00 a 23:00. Horario de ese día: 09:00 a 10:00 y 19:00 a 23:00. Reemplaza, en el horario que se superpone: cierre de hoy por lluvia. |
 
 ## Reglas de envío
 

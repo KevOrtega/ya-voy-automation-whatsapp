@@ -210,19 +210,30 @@ evento entrante, marcándolo procesado con `finalize` en la transacción del pas
   las 05:00 es del día calendario siguiente (`00:00` = 24:00, `01:00` = 25:00). Los instantes se arman con la
   hora local en `TZ` y se comparan en UTC, así que un día con cambio de horario de verano dura 23 o 25 horas
   sin errores (Buenos Aires no tiene, pero `TZ` es configurable).
-- Horario efectivo de `D` = (horario base + aperturas `open_window` activas de `D`) − cierres activos que tocan
-  `D`. **Precedencia: donde un cierre y una apertura se superponen, gana el cierre** (RF-08, RN-25), tanto en el
-  horario efectivo como en `is_accepting_orders`. `closed_today` corre hasta el fin del día operativo, así que
-  también cierra las aperturas de ese día (RN-26).
-- `is_accepting_orders(at)` (RN-18, para la etapa 4b): (1) si hay un cierre en vigor → cerrado con ese cierre; si
-  hay varios, el de mayor alcance (`closed_until_further_notice` > `closed_today` > `closed_window`, CU-10 3a);
+- **Precedencia: donde un cierre y una apertura se superponen, gana la instrucción confirmada más
+  recientemente** (RF-08, RN-25), ordenadas por `confirmed_at` y, a igual hora, por `id`. Horario efectivo de `D`:
+  se parte del horario base y se aplican encima, en ese orden, los cambios activos que tocan `D` (una apertura
+  suma su ventana, un cierre la quita). Ejemplo: `closed_today` confirmado a las 10:00 y "abrimos de 19 a 23"
+  confirmado a las 18:00 → abierto de 19 a 23; al revés (apertura primero, cierre después) queda cerrado en la
+  superposición. `closed_today` corre hasta el fin del día operativo y cierra las aperturas de ese día
+  confirmadas antes (RN-26); las confirmadas después reabren su ventana. Sirve igual para
+  `closed_until_further_notice` y `closed_window`.
+- `confirmed_at` es el `now()` de la transacción que confirma. Dos confirmaciones concurrentes de administradores
+  distintos pueden quedar ordenadas por el inicio de su transacción y no por su commit; el desempate por `id` hace
+  el orden determinístico.
+- `is_accepting_orders(at)` (RN-18, para la etapa 4b): (1) si hay cierres en vigor confirmados después de toda
+  apertura en vigor → cerrado; se informa el de mayor alcance entre ellos (`closed_until_further_notice` >
+  `closed_today` > `closed_window`, CU-10 3a);
   (2) si `at` está dentro del horario base de su día operativo o de una apertura en vigor → abierto; (3) si no →
   fuera de horario. Solo cuentan las filas `active` sin `cancelled_at`.
 - `report_due_at(D)`: el más tardío entre el fin del horario base y el fin de las aperturas activas de `D`; los
-  cierres no lo adelantan.
+  cierres no lo adelantan, ni siquiera uno confirmado después de la apertura (se puede levantar, y un reporte que
+  llega más tarde sin pedidos nuevos no hace daño).
 
 **Validación** (`ya_voy/schedule/intents.py`, `validate_schedule_intent`), con los cambios activos leídos en la
-misma transacción que guarda la solicitud: las reglas de [05](05-modelo-datos.md). Además, `closed_today` sin
+misma transacción que guarda la solicitud: las reglas de [05](05-modelo-datos.md), evaluadas como si la
+instrucción se confirmara ahora (es la más reciente). Una `open_window` es válida si abre algo que desde ahora no
+está abierto (también dentro del horario base, si un cierre lo había quitado). Además, `closed_today` sin
 horario efectivo restante en el día (por ejemplo, a las 23:30 sin aperturas) es inválido porque no cambia nada, y
 un `closed_window` dentro de un cierre ya activo queda vacío al recortarlo y también es inválido.
 
@@ -255,10 +266,15 @@ confirmar:
 - `open_window` reabre el reporte del día en la misma transacción con el `UPDATE` de [03](03-estados-pedido.md)
   (`sent`, `generating` o `correction_pending` → `correction_pending`, `due_at` = nuevo cierre efectivo).
 - Responde `admin_schedule_applied` (`schedule_override:{id}:applied`) con el estado resultante.
+- El resumen, al pedir confirmación y al aplicar, termina con lo que la instrucción reemplaza
+  (`overridden_in_overlap`): los cambios activos de signo contrario que deciden alguna parte de su período desde
+  ahora. Al aplicar se recalcula, porque otro administrador pudo confirmar algo entre medio.
+- `reopen` levanta todos los cierres en vigor, también los que una apertura posterior tapa en ese momento.
 
 `remind_still_closed` envía `admin_schedule_still_closed` una vez por día operativo y por cierre (clave
 `admin_schedule_still_closed:{fecha}:{id}`), desde `BUSINESS_HOURS_START`, si hay un `closed_until_further_notice`
-en vigor que empezó antes de ese inicio.
+que empezó antes de ese inicio y que cierra en ese momento (ninguna apertura posterior en vigor lo tapa). Si una
+apertura lo tapa, el recordatorio sale en la primera corrida después de que termine.
 
 Pendiente para la etapa 7b (`TODO(stage-7b)`): reconocer al administrador por número o `@lid` y conectar su
 texto privado con `schedules.handle_admin_text` (con `finalize`); `estado`/`horario` (CU-15,

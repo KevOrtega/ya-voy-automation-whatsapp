@@ -175,7 +175,7 @@ incluye la apertura.
 | `pending_confirmation` | Interpretado y validado; esperando "sí" / "no" del administrador. |
 | `active` | Cierre o apertura confirmados. Afecta al horario efectivo mientras `starts_at <= now < ends_at` (o sin fin) y no tenga `cancelled_at`. |
 | `applied` | Solo para `reopen`: confirmado y ejecutado (levantó los cierres en vigor). |
-| `cancelled` | Cierre levantado por un `reopen` (`cancelled_at`, `cancelled_by_override_id`). Las aperturas no se levantan con `reopen`; para acortarlas se carga un cierre, que tiene prioridad. |
+| `cancelled` | Cierre levantado por un `reopen` (`cancelled_at`, `cancelled_by_override_id`). Las aperturas no se levantan con `reopen`; para acortarlas se carga un cierre, que tiene prioridad por ser más reciente (RN-25). |
 | `rejected` | El administrador respondió "no". |
 | `expired` | No se confirmó en `SCHEDULE_CONFIRMATION_TTL_MINUTES`. |
 | `superseded` | Reemplazado por una instrucción nueva antes de confirmarse. |
@@ -204,27 +204,36 @@ stateDiagram-v2
 
 ```python
 def is_accepting_orders(now: datetime) -> AcceptanceDecision:
-    """(Base hours + active open windows) minus active closures, for the business day of `now`.
-    Returns whether orders are accepted and, if not, the reason (outside hours or the applying closure)."""
+    """Base hours, then the active overrides painted on top in confirmation order (most recent
+    wins, RN-25). Returns whether orders are accepted and, if not, the reason (outside hours or
+    the applying closure)."""
 
 
 def report_due_at(business_date: date) -> datetime:
     """Effective close of the business day: the later of BUSINESS_HOURS_END and the end of any
-    active open_window for that day. Closures never move it earlier (they can be lifted).
+    active open_window for that day. Closures never move it earlier, not even one confirmed
+    after the opening (they can be lifted).
     Used for the original report and, when the day is extended after its report was sent,
     for the correction that lists the orders added during the extension."""
 ```
 
 ```sql
--- Closure in effect now (closures win over openings)
-SELECT *
-  FROM schedule_overrides
- WHERE status = 'active'
-   AND kind IN ('closed_today', 'closed_until_further_notice', 'closed_window')
-   AND starts_at <= now()
-   AND (ends_at IS NULL OR ends_at > now())
- ORDER BY CASE kind WHEN 'closed_until_further_notice' THEN 1
-                    WHEN 'closed_today' THEN 2 ELSE 3 END
+-- Closure that closes now: in effect and confirmed after every opening in effect (most recent
+-- wins, tiebreak on id); the widest one if there are several
+SELECT c.*
+  FROM schedule_overrides c
+ WHERE c.status = 'active'
+   AND c.kind IN ('closed_today', 'closed_until_further_notice', 'closed_window')
+   AND c.starts_at <= now()
+   AND (c.ends_at IS NULL OR c.ends_at > now())
+   AND NOT EXISTS (
+         SELECT 1
+           FROM schedule_overrides o
+          WHERE o.status = 'active' AND o.kind = 'open_window'
+            AND o.starts_at <= now() AND o.ends_at > now()
+            AND (o.confirmed_at, o.id) > (c.confirmed_at, c.id))
+ ORDER BY CASE c.kind WHEN 'closed_until_further_notice' THEN 1
+                      WHEN 'closed_today' THEN 2 ELSE 3 END
  LIMIT 1;
 
 -- Extra opening in effect now
@@ -234,7 +243,8 @@ SELECT 1
    AND starts_at <= now() AND ends_at > now();
 ```
 
-Orden de evaluación: (1) si hay un cierre en vigor → cerrado, con ese motivo; (2) si la hora local está dentro
+Orden de evaluación: (1) si hay un cierre en vigor confirmado después de toda apertura en vigor → cerrado,
+con ese motivo; (2) si la hora local está dentro
 del horario base o hay una apertura en vigor → abierto; (3) si no → `outside_hours` (`store_out_of_hours`).
 
 El día operativo (`business_date`) de un instante es su fecha local, salvo que la hora local sea anterior a

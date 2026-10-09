@@ -547,7 +547,7 @@ Cada instrucción de horario del administrador, con su interpretación y su cicl
 | `inbound_event_id` | `bigint` | FK → `inbound_events.id`, nullable | |
 | `confirmation_expires_at` | `timestamptz` | `NOT NULL` | `created_at + SCHEDULE_CONFIRMATION_TTL_MINUTES`. |
 | `confirmation_wa_message_id` | `text` | nullable | Mensaje de confirmación del bot (permite confirmar citándolo). |
-| `confirmed_at` | `timestamptz` | nullable | |
+| `confirmed_at` | `timestamptz` | nullable | "Sí" del administrador (`now()` de la transacción que confirma). Decide la precedencia entre cierres y aperturas superpuestos: gana el más reciente; a igual `confirmed_at`, el `id` mayor (RN-25). |
 | `cancelled_at` | `timestamptz` | nullable | Levantado por un `reopen`. |
 | `cancelled_by_override_id` | `bigint` | FK → `schedule_overrides.id`, nullable | El `reopen` que lo levantó. |
 | `created_at` | `timestamptz` | `NOT NULL DEFAULT now()` | |
@@ -697,12 +697,20 @@ Validación determinística (`validate_schedule_intent`), antes de pedir confirm
   Las horas anteriores a `BUSINESS_DAY_ROLLOVER_TIME` se interpretan como del día calendario siguiente
   (`00:00` → 24:00, `01:00` → 25:00), y debe quedar inicio < fin.
 - `date` no puede ser pasada y, si es hoy, `end_time` debe ser posterior a la hora actual.
-- `closed_window` se recorta al horario efectivo del día; si queda vacía, es inválida.
+- `closed_window` se recorta al horario efectivo actual del día (el que resulta de aplicar la precedencia de
+  RN-25); si queda vacía, es inválida.
 - `open_window` debe quedar entre `SCHEDULE_EARLIEST_OPEN_TIME` (06:00) y `SCHEDULE_LATEST_CLOSE_TIME` (02:00 del
-  día siguiente) y debe agregar tiempo fuera del horario base (la parte que se superpone se ignora). Si el reporte
+  día siguiente) y debe agregar tiempo abierto desde ahora: alguna parte de la ventana posterior a la hora actual
+  tiene que estar fuera del horario efectivo actual (la parte que se superpone se ignora). Así, después de un
+  cierre se puede abrir una ventana dentro del horario base ("abrimos de 19 a 23" tras "hoy no tomamos por
+  lluvia"), y por ser más reciente gana sobre el cierre (RN-25). Si el reporte
   de ese día ya se envió, la apertura se permite igual: el resumen de confirmación lo advierte y, al confirmar, el
   reporte se reabre (ver [03](03-estados-pedido.md)).
 - Horas ambiguas ("de 3 a 6") se interpretan dentro del horario base (15:00–18:00); el resumen de
   confirmación muestra siempre las horas en formato 24 h para que el administrador lo verifique.
-- `reopen` solo se propone si hay cierres en vigor; si no, se responde sin pedir confirmación.
+- `reopen` solo se propone si hay cierres en vigor; si no, se responde sin pedir confirmación. Levanta todos los
+  cierres en vigor, también los que una apertura posterior tapa en ese momento.
+- El resumen de confirmación (y el de "Listo") lista lo que la instrucción nueva reemplaza: las instrucciones
+  activas de signo contrario (aperturas para un cierre, cierres para una apertura) que hoy deciden alguna parte
+  de su período desde ahora. Se recalcula al confirmar, porque la precedencia se decide por `confirmed_at`.
 
