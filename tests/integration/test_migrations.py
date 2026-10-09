@@ -41,6 +41,12 @@ DOC_NAMED_OBJECTS = {
     "schedule_overrides_period",
     "schedule_overrides_window",
     "schedule_overrides_active",
+    "schedule_overrides_status_by_kind",
+    "schedule_overrides_business_date_by_kind",
+    "messages_inbound_event_only_in",
+    "messages_outbound_message_only_out",
+    "outbound_messages_target_for_delete_edit",
+    "outbound_messages_revision_for_document",
 }
 
 SNAPSHOT_QUERIES = {

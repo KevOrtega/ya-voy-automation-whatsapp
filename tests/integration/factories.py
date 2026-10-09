@@ -102,6 +102,12 @@ def override(**kw: Any) -> Insert:
         "created_by": "5491100000000",
         "confirmation_expires_at": NOW,
     } | kw
+    if "business_date" not in kw and values["kind"] in (
+        "closed_today",
+        "closed_window",
+        "open_window",
+    ):
+        values["business_date"] = TODAY
     return insert(m.ScheduleOverride).values(**values)
 
 

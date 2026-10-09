@@ -261,7 +261,9 @@ async def test_message_constraints(engine: AsyncEngine) -> None:
     await f.assert_rejected(engine, f.message(direction="both"), "messages_direction_check")
     await f.assert_rejected(engine, f.message(kind=None), 'column "kind"')
     for fk in ("store_id", "courier_id", "order_id", "inbound_event_id", "outbound_message_id"):
-        await f.assert_rejected(engine, f.message(**{fk: 424242}), f"messages_{fk}_fkey")
+        direction = "out" if fk == "outbound_message_id" else "in"
+        stmt = f.message(direction=direction, **{fk: 424242})
+        await f.assert_rejected(engine, stmt, f"messages_{fk}_fkey")
 
 
 # --- outbound_messages --------------------------------------------------------------------
@@ -416,3 +418,119 @@ async def test_ids_are_generated_always(engine: AsyncEngine) -> None:
         text("INSERT INTO stores (id, wa_jid, display_name) VALUES (1, 'a@s.whatsapp.net', 'a')"),
         'cannot insert a non-DEFAULT value into column "id"',
     )
+
+
+# --- structural CHECKs added after the stage 2 audit --------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["closed_window", "open_window"])
+async def test_override_window_requires_start(engine: AsyncEngine, kind: str) -> None:
+    for status in ("pending_confirmation", "rejected", "expired"):
+        await f.assert_rejected(
+            engine,
+            f.override(kind=kind, status=status, business_date=f.TODAY, ends_at=f.NOW),
+            "schedule_overrides_window",
+        )
+
+
+async def test_message_inbound_event_only_for_incoming(engine: AsyncEngine) -> None:
+    iid = await f.insert_ok(engine, f.inbound())
+    await f.assert_rejected(
+        engine,
+        f.message(direction="out", inbound_event_id=iid),
+        "messages_inbound_event_only_in",
+    )
+    await f.insert_ok(engine, f.message(direction="in", inbound_event_id=iid))
+    await f.insert_ok(engine, f.message(direction="in"))  # not required when 'in' (doc 05)
+
+
+async def test_message_outbound_message_only_for_outgoing(engine: AsyncEngine) -> None:
+    oid = await f.insert_ok(engine, f.outbound())
+    await f.assert_rejected(
+        engine,
+        f.message(direction="in", outbound_message_id=oid),
+        "messages_outbound_message_only_out",
+    )
+    await f.insert_ok(engine, f.message(direction="out", outbound_message_id=oid))
+    await f.insert_ok(engine, f.message(direction="out"))
+
+
+@pytest.mark.parametrize("message_type", ["delete", "edit"])
+async def test_outbound_delete_edit_need_target(engine: AsyncEngine, message_type: str) -> None:
+    await f.assert_rejected(
+        engine,
+        f.outbound(message_type=message_type),
+        "outbound_messages_target_for_delete_edit",
+    )
+    await f.insert_ok(engine, f.outbound(message_type=message_type, target_wa_message_id="3EB0A"))
+
+
+async def test_outbound_text_needs_no_target_or_revision(engine: AsyncEngine) -> None:
+    await f.insert_ok(engine, f.outbound(message_type="text"))
+
+
+async def test_outbound_document_needs_report_revision(engine: AsyncEngine) -> None:
+    await f.assert_rejected(
+        engine,
+        f.outbound(message_type="document"),
+        "outbound_messages_revision_for_document",
+    )
+    rid = await f.insert_ok(engine, f.daily_report())
+    vid = await f.insert_ok(engine, f.revision(rid))
+    await f.insert_ok(engine, f.outbound(message_type="document", report_revision_id=vid))
+
+
+_CLOSURES = ("closed_today", "closed_until_further_notice", "closed_window")
+_SHARED_STATUSES = ("pending_confirmation", "rejected", "expired", "superseded")
+
+
+def _valid_override(kind: str, status: str, admin: int) -> dict[str, object]:
+    """Columns that satisfy every other CHECK for ``kind``/``status``."""
+    values: dict[str, object] = {"kind": kind, "status": status, "created_by": f"549110{admin:07d}"}
+    if kind in ("closed_today", "closed_window", "open_window"):
+        values["business_date"] = f.TODAY
+    if kind != "reopen":
+        values["starts_at"] = f.NOW
+    if kind in ("closed_window", "open_window"):
+        values["ends_at"] = f.NOW + dt.timedelta(hours=2)
+    return values
+
+
+@pytest.mark.parametrize(
+    ("kind", "allowed", "rejected"),
+    [
+        ("reopen", ("applied",), ("active", "cancelled")),
+        ("open_window", ("active",), ("applied", "cancelled")),
+        *[(k, ("active", "cancelled"), ("applied",)) for k in _CLOSURES],
+    ],
+)
+async def test_override_status_by_kind(
+    engine: AsyncEngine, kind: str, allowed: tuple[str, ...], rejected: tuple[str, ...]
+) -> None:
+    for i, status in enumerate((*allowed, *_SHARED_STATUSES)):
+        await f.insert_ok(engine, f.override(**_valid_override(kind, status, i)))
+    for i, status in enumerate(rejected, start=100):
+        await f.assert_rejected(
+            engine,
+            f.override(**_valid_override(kind, status, i)),
+            "schedule_overrides_status_by_kind",
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "needs_date"),
+    [
+        ("closed_today", True),
+        ("closed_window", True),
+        ("open_window", True),
+        ("closed_until_further_notice", False),
+        ("reopen", False),
+    ],
+)
+async def test_override_business_date_by_kind(
+    engine: AsyncEngine, kind: str, needs_date: bool
+) -> None:
+    good = _valid_override(kind, "pending_confirmation", 1)
+    bad = {**_valid_override(kind, "rejected", 2), "business_date": None if needs_date else f.TODAY}
+    await f.insert_ok(engine, f.override(**good))
+    await f.assert_rejected(engine, f.override(**bad), "schedule_overrides_business_date_by_kind")
