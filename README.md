@@ -55,7 +55,8 @@ make lint         # ruff check + ruff format --check
 make format       # ruff --fix + format
 ```
 
-Inside Docker: `docker compose run --rm --no-deps web pytest`. New migrations (stage 2 onwards):
+Full suite in Docker, including integration tests against the compose Postgres/Redis:
+`make test-docker`. New migrations (stage 2 onwards):
 `make revision m="create orders"`, then `make migrate`.
 
 All settings are environment variables (see [`.env.example`](.env.example) and
