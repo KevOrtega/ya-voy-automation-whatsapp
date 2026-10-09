@@ -8,7 +8,7 @@ import pytest
 import respx
 
 from tests.conftest import make_settings
-from ya_voy.whatsapp.client import EvolutionClient, EvolutionError
+from ya_voy.whatsapp.client import EvolutionClient, EvolutionError, is_retryable_status
 
 BASE = "http://evolution:8080"
 API_KEY = "evo-key-123"
@@ -113,3 +113,37 @@ async def test_from_settings() -> None:
     client = EvolutionClient.from_settings(settings)
     assert client.instance == "i"
     await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [
+        (None, True),  # network error / timeout
+        (408, True),
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (422, False),
+        (200, False),  # unusable 2xx body: may have been sent, do not resend
+    ],
+)
+def test_retry_classification(status_code: int | None, retryable: bool) -> None:
+    assert is_retryable_status(status_code) is retryable
+    assert EvolutionError("op", "x", status_code).retryable is retryable
+
+
+def test_explicit_retryable_overrides_status() -> None:
+    assert EvolutionError("op", "x", retryable=False).retryable is False
+
+
+@respx.mock
+async def test_timeout_is_retryable(client: EvolutionClient) -> None:
+    respx.post(f"{BASE}/message/sendText/yavoy").mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(EvolutionError) as info:
+        await client.send_text("x", "hola")
+    assert info.value.retryable

@@ -17,13 +17,36 @@ DEFAULT_TIMEOUT_SECONDS = 15.0
 _ERROR_BODY_LIMIT = 500
 
 
+# 4xx answers that mean "try again later" rather than "this request is wrong".
+RETRYABLE_CLIENT_ERRORS = frozenset({408, 429})
+
+
+def is_retryable_status(status_code: int | None) -> bool:
+    """Retry policy of the outbox: network errors/timeouts (no status), 5xx, 408 and 429.
+
+    Any other status is permanent: other 4xx (bad number, unknown message, ...) and a 2xx whose
+    body is unusable (the message may have gone out; retrying could send it twice).
+    """
+    if status_code is None:
+        return True
+    return status_code >= 500 or status_code in RETRYABLE_CLIENT_ERRORS
+
+
 class EvolutionError(Exception):
     """A failed Evolution call. The message never includes the API key."""
 
-    def __init__(self, operation: str, detail: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        operation: str,
+        detail: str,
+        status_code: int | None = None,
+        *,
+        retryable: bool | None = None,
+    ) -> None:
         self.operation = operation
         self.status_code = status_code
         self.detail = detail
+        self.retryable = is_retryable_status(status_code) if retryable is None else retryable
         prefix = f"{operation}: HTTP {status_code}" if status_code else f"{operation}"
         super().__init__(f"{prefix}: {detail}")
 

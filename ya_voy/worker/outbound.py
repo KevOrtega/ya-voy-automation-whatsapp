@@ -5,8 +5,10 @@
 - FIFO per recipient: a row waits while an earlier row for the same ``recipient_jid`` is still
   ``pending``/``sending``. A ``failed`` earlier row does not block the queue.
 - Global pacing: at most one send every ``OUTBOUND_MIN_INTERVAL_MS`` (``SET NX PX`` in Redis).
-- On error: back off (``2 ** attempts`` s, capped) and retry up to ``OUTBOUND_MAX_ATTEMPTS``;
-  then ``failed`` and ``admin_outbound_failed`` to every admin.
+- Transient errors (network/timeout, 5xx, 408, 429): back off (``2 ** attempts`` s, capped) and
+  retry up to ``OUTBOUND_MAX_ATTEMPTS``. Permanent errors (any other 4xx, unusable 2xx body,
+  missing report file) go straight to ``failed``. Either way, ``failed`` sends
+  ``admin_outbound_failed`` to every admin (never for a failed alert itself).
 
 The row lock is held during the Evolution call, so ``sending`` is only visible inside that
 transaction; a crash rolls back to ``pending`` and the recovery sweep re-enqueues it.
@@ -67,7 +69,9 @@ async def _deliver(
     if kind is OutboundMessageType.DOCUMENT:
         revision = await session.get(ReportRevision, row.report_revision_id)
         if revision is None or revision.file_content is None:
-            raise EvolutionError("sendMedia", "report revision has no file content")
+            raise EvolutionError(
+                "sendMedia", "report revision has no file content", retryable=False
+            )
         return await evolution.send_document(
             row.recipient_jid,
             media_base64=base64.b64encode(revision.file_content).decode(),
@@ -144,12 +148,17 @@ async def _send_locked(
         sent = await _deliver(session, ctx["evolution"], row)
     except EvolutionError as exc:
         row.last_error = str(exc)[:ERROR_LIMIT]
-        if row.attempts < settings.outbound_max_attempts:
+        if exc.retryable and row.attempts < settings.outbound_max_attempts:
             row.status = OutboundStatus.PENDING
             delay = backoff_delay(row.attempts)
             await redis.set(BACKOFF_KEY.format(id=row.id), 1, px=int(delay.total_seconds() * 1000))
             return _Outcome("retry", defer=delay)
         row.status = OutboundStatus.FAILED
+        if not exc.retryable:
+            logger.error(
+                "outbound message failed permanently",
+                extra={"outbound_message_id": row.id, "error": row.last_error},
+            )
         return _Outcome("failed", alert_ids=await _failure_alert(session, settings, row))
 
     row.status = OutboundStatus.SENT

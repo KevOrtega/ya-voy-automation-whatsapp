@@ -212,6 +212,86 @@ async def test_error_retries_with_backoff_then_fails_and_alerts(
     assert await send_outbound(ctx, row_id) == "skipped:failed"
 
 
+@pytest.mark.parametrize("status_code", [400, 401, 404, 422])
+async def test_client_errors_are_permanent(
+    engine: AsyncEngine,
+    worker_ctx: Ctx,
+    evo: respx.MockRouter,
+    arq_redis: ArqRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+    status_code: int,
+) -> None:
+    evo["sendText"].side_effect = None
+    evo["sendText"].respond(status_code, json={"message": "bad request"})
+    row_id = await f.insert_ok(engine, f.outbound(recipient_jid=STORE_JID))
+    assert await send_outbound(worker_ctx(outbound_max_attempts=5), row_id) == "failed"
+    assert evo["sendText"].call_count == 1  # no retry
+    row = await get_row(session_factory, row_id)
+    assert (row.status, row.attempts) == ("failed", 1)
+    assert f"HTTP {status_code}" in (row.last_error or "")
+    assert await arq_redis.pttl(BACKOFF_KEY.format(id=row_id)) < 0
+    jobs = {a for (_, (a,)) in await queued(arq_redis, "send_outbound")}
+    async with session_factory() as session:
+        alerts = (
+            await session.scalars(
+                select(OutboundMessage).where(
+                    OutboundMessage.template_key == "admin_outbound_failed"
+                )
+            )
+        ).all()
+    assert len(alerts) == 2
+    assert row_id not in jobs
+    assert {a.id for a in alerts} == jobs
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.Response(408),
+        httpx.Response(429),
+        httpx.Response(500),
+        httpx.Response(502),
+        httpx.Response(503),
+        httpx.ConnectError("connection refused"),
+        httpx.ReadTimeout("timed out"),
+    ],
+    ids=["408", "429", "500", "502", "503", "connect-error", "timeout"],
+)
+async def test_transient_errors_are_retried_then_succeed(
+    engine: AsyncEngine,
+    worker_ctx: Ctx,
+    evo: respx.MockRouter,
+    arq_redis: ArqRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+    failure: httpx.Response | Exception,
+) -> None:
+    evo["sendText"].side_effect = [failure, httpx.Response(201, json={"key": {"id": "OK1"}})]
+    row_id = await f.insert_ok(engine, f.outbound(recipient_jid=STORE_JID))
+    ctx = worker_ctx(outbound_max_attempts=5)
+    assert await send_outbound(ctx, row_id) == "retry"
+    row = await get_row(session_factory, row_id)
+    assert (row.status, row.attempts) == ("pending", 1)
+    assert await arq_redis.pttl(BACKOFF_KEY.format(id=row_id)) > 0
+    assert await queued(arq_redis, "send_outbound") == [("send_outbound", (row_id,))]
+
+    await arq_redis.delete(BACKOFF_KEY.format(id=row_id))  # the backoff elapsed
+    assert await send_outbound(ctx, row_id) == "sent"
+    row = await get_row(session_factory, row_id)
+    assert (row.status, row.attempts, row.wa_message_id) == ("sent", 2, "OK1")
+
+
+async def test_missing_report_file_is_permanent(
+    engine: AsyncEngine, worker_ctx: Ctx, evo: respx.MockRouter
+) -> None:
+    report_id = await f.insert_ok(engine, f.daily_report())
+    revision_id = await f.insert_ok(engine, f.revision(report_id))  # no file_content
+    row_id = await f.insert_ok(
+        engine, f.outbound(message_type="document", report_revision_id=revision_id)
+    )
+    assert await send_outbound(worker_ctx(outbound_max_attempts=5), row_id) == "failed"
+    assert evo["sendMedia"].call_count == 0
+
+
 async def test_failed_admin_alert_does_not_alert_again(
     engine: AsyncEngine,
     worker_ctx: Ctx,
