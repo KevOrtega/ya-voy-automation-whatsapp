@@ -5,6 +5,8 @@ description: Use when you have a spec or requirements for a multi-step task, bef
 
 # Writing Plans
 
+> **Ya Voy override:** in this repo, save plans to `docs/plans/YYYY-MM-DD-<feature-name>.md` (in English), not `docs/superpowers/plans/`. Wherever this skill mentions `docs/superpowers/plans/`, use `docs/plans/` instead. See `AGENTS.md`.
+
 ## Overview
 
 Write implementation plans for an engineer who has not seen this codebase or this spec. Assume they write idiomatic code in the project's language once they know the exact interface and the exact test, and that they will make a reasonable choice wherever the plan leaves one open. What they cannot know is what you decided: which files, which names and signatures, which values from the spec, which tests prove each task. Document those. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.

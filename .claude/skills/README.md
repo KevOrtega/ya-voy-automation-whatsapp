@@ -39,6 +39,8 @@ Notes on the vendored copies:
   skill folder with the same name here.
 - Their default paths (`docs/superpowers/plans/`, `docs/superpowers/specs/`) are overridden by
   `AGENTS.md`: plans for this project go to `docs/plans/`.
+- Local modification: `writing-plans/SKILL.md` has one added override note under its title
+  pointing to `docs/plans/`; everything else is byte-identical to upstream.
 - `executing-plans` and `subagent-driven-development` share helper scripts and keep a
   per-plan workspace under `.superpowers/sdd/`, which ignores itself in git.
 - `executing-plans` mentions `../using-superpowers/references/` for per-harness tool names;
