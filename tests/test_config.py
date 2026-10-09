@@ -99,11 +99,54 @@ def test_invalid_timezone_rejected() -> None:
         make_settings(tz="Mars/Olympus_Mons")
 
 
-def test_production_requires_secrets() -> None:
-    with pytest.raises(ValidationError, match="WEBHOOK_SECRET"):
-        make_settings(app_env="production", evolution_api_key="k")
-    s = make_settings(app_env="production", evolution_api_key="k", webhook_secret="w")
-    assert not s.is_development
+PRODUCTION = {
+    "app_env": "production",
+    "webhook_secret": "w",
+    "evolution_api_key": "k",
+    "llm_api_key": "sk-x",
+    "llm_model": "m",
+}
+
+
+def test_production_with_every_secret_is_valid() -> None:
+    assert not make_settings(**PRODUCTION).is_development
+
+
+@pytest.mark.parametrize(
+    ("missing", "env_var"),
+    [
+        ("webhook_secret", "WEBHOOK_SECRET"),
+        ("evolution_api_key", "EVOLUTION_API_KEY"),
+        ("llm_api_key", "LLM_API_KEY"),
+        ("llm_model", "LLM_MODEL"),
+    ],
+)
+def test_production_requires_secrets(missing: str, env_var: str) -> None:
+    with pytest.raises(ValidationError, match=env_var):
+        make_settings(**(PRODUCTION | {missing: ""}))
+
+
+def test_production_rejects_blank_llm_model() -> None:
+    with pytest.raises(ValidationError, match="LLM_MODEL"):
+        make_settings(**(PRODUCTION | {"llm_model": "   "}))
+
+
+def test_production_reports_every_missing_secret() -> None:
+    with pytest.raises(
+        ValidationError, match="WEBHOOK_SECRET, EVOLUTION_API_KEY, LLM_API_KEY, LLM_MODEL"
+    ):
+        make_settings(app_env="production")
+
+
+def test_production_refuses_the_fake_llm() -> None:
+    with pytest.raises(ValidationError, match="LLM_PROVIDER=fake"):
+        make_settings(**(PRODUCTION | {"llm_provider": "fake"}))
+
+
+def test_development_does_not_require_llm_settings() -> None:
+    settings = make_settings(app_env="development")
+    assert settings.llm_api_key.get_secret_value() == "" and settings.llm_model == ""
+    assert make_settings(app_env="development", llm_provider="fake").llm_provider == "fake"
 
 
 def test_capture_mode_defaults_off() -> None:
@@ -115,9 +158,7 @@ def test_capture_mode_defaults_off() -> None:
 def test_capture_mode_is_refused_in_production() -> None:
     with pytest.raises(ValidationError, match="CAPTURE_INBOUND_PAYLOADS"):
         make_settings(
-            app_env="production",
-            webhook_secret="s",
-            evolution_api_key="k",
+            **PRODUCTION,
             capture_inbound_payloads=True,
         )
 

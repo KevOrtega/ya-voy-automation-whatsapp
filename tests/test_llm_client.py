@@ -155,8 +155,6 @@ def test_factory_builds_openai_compatible_from_settings() -> None:
         {"llm_provider": "openai", "llm_api_key": "sk-x"},
         {"llm_provider": "openai", "llm_model": "m"},
         {"llm_provider": "anthropic", "llm_api_key": "k", "llm_model": "m"},
-        {"llm_provider": "fake", "app_env": "production", "webhook_secret": "s",
-         "evolution_api_key": "k"},
     ],
 )  # fmt: skip
 def test_factory_rejects_incomplete_config(overrides: dict) -> None:

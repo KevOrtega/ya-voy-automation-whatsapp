@@ -150,6 +150,8 @@ class Settings(BaseSettings):
                 for name, secret in (
                     ("WEBHOOK_SECRET", self.webhook_secret),
                     ("EVOLUTION_API_KEY", self.evolution_api_key),
+                    ("LLM_API_KEY", self.llm_api_key),
+                    ("LLM_MODEL", SecretStr(self.llm_model.strip())),
                 )
                 if not secret.get_secret_value()
             ]
@@ -157,6 +159,8 @@ class Settings(BaseSettings):
                 raise ValueError(f"required in production: {', '.join(missing)}")
             if self.capture_inbound_payloads:
                 raise ValueError("CAPTURE_INBOUND_PAYLOADS is for development only")
+            if self.llm_provider.strip().lower() == "fake":
+                raise ValueError("LLM_PROVIDER=fake is for development only")
         return self
 
     @property
