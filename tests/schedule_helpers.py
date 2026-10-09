@@ -27,7 +27,11 @@ def override(
     status: ScheduleOverrideStatus = ScheduleOverrideStatus.ACTIVE,
     cancelled_at: dt.datetime | None = None,
     id: int | None = None,
+    confirmed_at: dt.datetime | None = None,
 ) -> OverrideView:
+    """``confirmed_at`` decides precedence (most recent wins); ``None`` ranks as the newest."""
     if kind in (K.CLOSED_UNTIL_FURTHER_NOTICE, K.REOPEN):
         day = None
-    return OverrideView(id, kind, status, day, starts_at, ends_at, reason, cancelled_at)
+    return OverrideView(
+        id, kind, status, day, starts_at, ends_at, reason, cancelled_at, confirmed_at
+    )

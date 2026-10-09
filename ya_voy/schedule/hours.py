@@ -1,11 +1,13 @@
 """Effective schedule of a business day (RF-07, RF-08, RN-18, RN-25, RN-26; docs/03 §2).
 
 Pure code: callers load the ``schedule_overrides`` rows (see ``repository``) and pass them in as
-:class:`OverrideView`. Precedence (RF-08, RN-25): effective hours = (base hours + active
-``open_window``) minus active closures; **a closure always wins over an opening** where they
-overlap.
-Between closures in effect at the same instant, the widest one is reported
-(``closed_until_further_notice`` > ``closed_today`` > ``closed_window``, CU-10 3a).
+:class:`OverrideView`.
+
+Precedence (RF-08, RN-25): **the most recently confirmed instruction wins** where a closure and an
+opening overlap. The base hours are the bottom layer; the applied overrides are painted on top in
+:meth:`OverrideView.rank` order (``confirmed_at``, then ``id``): an ``open_window`` makes its period
+open, a closure makes its period closed. Among the closures that win at an instant, the widest one
+is reported (``closed_until_further_notice`` > ``closed_today`` > ``closed_window``, CU-10 3a).
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ CLOSURE_KINDS = frozenset(
         ScheduleOverrideKind.CLOSED_WINDOW,
     }
 )
+FAR_PAST = dt.datetime.min.replace(tzinfo=dt.UTC)
+FAR_FUTURE = dt.datetime.max.replace(tzinfo=dt.UTC)
 CLOSURE_PRIORITY = {
     ScheduleOverrideKind.CLOSED_UNTIL_FURTHER_NOTICE: 1,
     ScheduleOverrideKind.CLOSED_TODAY: 2,
@@ -94,6 +98,7 @@ class OverrideView:
     ends_at: dt.datetime | None
     reason: str | None = None
     cancelled_at: dt.datetime | None = None
+    confirmed_at: dt.datetime | None = None
 
     @classmethod
     def of(cls, row: Any) -> OverrideView:
@@ -106,7 +111,23 @@ class OverrideView:
             ends_at=row.ends_at,
             reason=row.reason,
             cancelled_at=row.cancelled_at,
+            confirmed_at=row.confirmed_at,
         )
+
+    @property
+    def rank(self) -> tuple[bool, dt.datetime, bool, int]:
+        """Precedence order: later ``confirmed_at`` wins, then the higher ``id``. Not yet confirmed
+        (a proposal being evaluated) or not yet stored ranks above everything already applied."""
+        return (
+            self.confirmed_at is None,
+            self.confirmed_at or FAR_PAST,
+            self.id is None,
+            self.id or 0,
+        )
+
+    @property
+    def is_opening(self) -> bool:
+        return self.kind == ScheduleOverrideKind.OPEN_WINDOW
 
     @property
     def is_closure(self) -> bool:
@@ -166,23 +187,42 @@ def base_interval(settings: Settings, day: dt.date) -> Interval:
     )
 
 
+def _widest_first(closures: Iterable[OverrideView]) -> list[OverrideView]:
+    return sorted(closures, key=lambda o: (CLOSURE_PRIORITY[o.kind], o.starts_at))
+
+
 def closures_in_effect(overrides: Iterable[OverrideView], at: dt.datetime) -> list[OverrideView]:
-    """Closures in effect at ``at``, widest first (CU-10 3a)."""
-    found = [o for o in overrides if o.is_closure and o.in_effect(at)]
-    return sorted(found, key=lambda o: (CLOSURE_PRIORITY[o.kind], o.starts_at))
+    """Every closure in effect at ``at``, even one a later opening overrides; widest first.
+
+    ``reopen`` lifts these (RF-44)."""
+    return _widest_first(o for o in overrides if o.is_closure and o.in_effect(at))
+
+
+def winning_closures(overrides: Iterable[OverrideView], at: dt.datetime) -> list[OverrideView]:
+    """Closures in effect at ``at`` confirmed after every opening in effect at ``at``: the ones
+    that actually close the store then (most recent wins). Widest first (CU-10 3a)."""
+    overrides = list(overrides)
+    openings = [o.rank for o in overrides if o.is_opening and o.in_effect(at)]
+    newest_opening = max(openings, default=None)
+    return _widest_first(
+        o
+        for o in closures_in_effect(overrides, at)
+        if newest_opening is None or o.rank > newest_opening
+    )
 
 
 def decide_acceptance(
     settings: Settings, overrides: Iterable[OverrideView], at: dt.datetime
 ) -> AcceptanceDecision:
-    """``is_accepting_orders`` (docs/03 §2): (1) closure in effect → closed with it; (2) inside
-    the base hours of the business day or an opening in effect → open; (3) outside hours."""
+    """``is_accepting_orders`` (docs/03 §2): (1) a closure in effect confirmed after every
+    opening in effect → closed with it (the widest such); (2) inside the base hours of the business
+    day or an opening in effect → open; (3) outside hours."""
     overrides = list(overrides)
     day = business_date(at, settings.zoneinfo, settings.business_day_rollover_time)
-    closures = closures_in_effect(overrides, at)
+    closures = winning_closures(overrides, at)
     if closures:
         return AcceptanceDecision(False, AcceptanceReason.CLOSED, day, closures[0])
-    opening = any(o.kind == ScheduleOverrideKind.OPEN_WINDOW and o.in_effect(at) for o in overrides)
+    opening = any(o.is_opening and o.in_effect(at) for o in overrides)
     if opening or base_interval(settings, day).contains(at):
         return AcceptanceDecision(True, AcceptanceReason.OPEN, day)
     return AcceptanceDecision(False, AcceptanceReason.OUTSIDE_HOURS, day)
@@ -219,20 +259,54 @@ def closures_touching(
 def effective_intervals(
     settings: Settings, overrides: Iterable[OverrideView], day: dt.date
 ) -> list[Interval]:
-    """(Base + openings of ``day``) minus closures, within the business day (closures win)."""
-    overrides = list(overrides)
+    """Open periods of business day ``day``: the base hours, then every applied override touching
+    the day painted on top in :attr:`OverrideView.rank` order (most recent wins)."""
     bounds = day_bounds(settings, day)
-    opens = [base_interval(settings, day)]
-    opens += [o.interval(bounds.end) for o in openings_of(overrides, day)]
-    cuts = [o.interval(bounds.end) for o in closures_touching(settings, overrides, day)]
-    return intersect_all(subtract(union(opens), cuts), bounds)
+    layers = sorted(
+        (
+            o
+            for o in overrides
+            if (o.is_closure or o.is_opening)
+            and o.is_applied
+            and o.interval(bounds.end).intersect(bounds)
+        ),
+        key=lambda o: o.rank,
+    )
+    state = intersect_all([base_interval(settings, day)], bounds)
+    for o in layers:
+        period = o.interval(bounds.end)
+        state = union([*state, period]) if o.is_opening else subtract(state, [period])
+    return intersect_all(state, bounds)
+
+
+def overridden_in_overlap(
+    overrides: Iterable[OverrideView], new: OverrideView, now: dt.datetime
+) -> list[OverrideView]:
+    """Applied overrides of the opposite polarity that ``new`` overrides from ``now`` on: those
+    that are the top layer somewhere inside ``new``'s period (``{replaced_list}``)."""
+    overrides = [o for o in overrides if o.is_applied and (o.is_closure or o.is_opening)]
+    if new.starts_at is None:
+        return []
+    target = Interval(max(new.starts_at, now), new.ends_at or FAR_FUTURE)
+    if target.is_empty:
+        return []
+    found: list[OverrideView] = []
+    for o in sorted(overrides, key=lambda o: o.rank):
+        if o.is_closure == new.is_closure or o.rank >= new.rank:
+            continue
+        above = [p.interval(FAR_FUTURE) for p in overrides if p.rank > o.rank]
+        visible = subtract([o.interval(FAR_FUTURE)], above)
+        if intersect_all(visible, target):
+            found.append(o)
+    return found
 
 
 def report_due_at(
     settings: Settings, overrides: Iterable[OverrideView], day: dt.date
 ) -> dt.datetime:
     """Effective close of ``day``: the later of the base end and the end of any applied opening.
-    Closures never move it earlier (they can be lifted)."""
+    Closures never move it earlier, even one confirmed after the opening (it can be lifted, and a
+    late report with zero orders is harmless)."""
     ends = [base_interval(settings, day).end]
     ends += [o.ends_at for o in openings_of(overrides, day) if o.ends_at is not None]
     return max(ends)

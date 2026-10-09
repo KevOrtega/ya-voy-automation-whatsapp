@@ -14,9 +14,12 @@ from ya_voy.messaging.schedule_texts import effective_hours
 from ya_voy.schedule.calendar import business_date, business_day_bounds, local_at
 from ya_voy.schedule.hours import (
     AcceptanceReason,
+    closures_in_effect,
     decide_acceptance,
     effective_intervals,
+    overridden_in_overlap,
     report_due_at,
+    winning_closures,
 )
 
 S = make_settings()
@@ -167,23 +170,123 @@ def test_closed_window_cuts_the_day() -> None:
     assert hours(window) == "09:00 a 15:00 y 18:00 a 23:00"
 
 
-def test_closure_wins_over_an_overlapping_opening() -> None:
-    """RF-08 / RN-25: where a closure and an opening overlap, the closure wins."""
-    opening = override(K.OPEN_WINDOW, at(9, 23), at(10, 1))
-    closure = override(K.CLOSED_WINDOW, at(9, 22), at(10, 0, 30))
-    assert decide(at(9, 23, 30), opening, closure).reason == AcceptanceReason.CLOSED
-    assert decide(at(10, 0, 15), opening, closure).reason == AcceptanceReason.CLOSED
+# Most recent wins (RF-08, RN-25): the later confirmation decides where a closure and an opening
+# overlap. ``confirmed_at`` below is the confirmation time of each instruction.
+
+
+def test_later_opening_overrides_an_earlier_closed_today() -> None:
+    """The auditor's example: closed_today at 10:00, then "abrimos de 19 a 23" at 18:00."""
+    rain = override(K.CLOSED_TODAY, at(9, 10), at(10, 5), reason="lluvia", confirmed_at=at(9, 10))
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(9, 23), confirmed_at=at(9, 18))
+    assert decide(at(9, 20), rain, opening).accepting
+    assert decide(at(9, 18, 30), rain, opening).closure == rain
+    assert decide(at(9, 23, 30), rain, opening).closure == rain  # after the opening
+    assert hours(rain, opening) == "09:00 a 10:00 y 19:00 a 23:00"
+
+
+def test_later_closed_today_overrides_an_earlier_opening() -> None:
+    """RN-26 holds for the openings confirmed before it: closed_today closes them too."""
+    opening = override(K.OPEN_WINDOW, at(9, 23), at(10, 1), confirmed_at=at(9, 10))
+    rain = override(K.CLOSED_TODAY, at(9, 18), at(10, 5), reason="lluvia", confirmed_at=at(9, 18))
+    assert decide(at(10, 0, 30), opening, rain).closure == rain
+    assert hours(opening, rain) == "09:00 a 18:00"
+    assert report_due_at(S, [opening, rain], D) == at(10, 1)  # closures never move it
+
+
+def test_later_opening_past_midnight_overrides_an_earlier_closure() -> None:
+    rain = override(K.CLOSED_TODAY, at(9, 10), at(10, 5), confirmed_at=at(9, 10))
+    late = override(K.OPEN_WINDOW, at(9, 23), at(10, 1), confirmed_at=at(9, 18))
+    assert decide(at(9, 22), rain, late).closure == rain
+    assert decide(at(10, 0, 30), rain, late).accepting
+    assert decide(at(10, 1), rain, late).closure == rain
+    assert hours(rain, late) == "09:00 a 10:00 y 23:00 a 01:00"
+
+
+def test_closure_then_partially_overlapping_opening() -> None:
+    closure = override(K.CLOSED_WINDOW, at(9, 15), at(9, 20), confirmed_at=at(9, 10))
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(10, 0, 30), confirmed_at=at(9, 12))
+    assert decide(at(9, 18), closure, opening).closure == closure
+    assert decide(at(9, 19, 30), closure, opening).accepting
+    assert hours(closure, opening) == "09:00 a 15:00 y 19:00 a 00:30"
+
+
+def test_opening_then_partially_overlapping_closure() -> None:
+    opening = override(K.OPEN_WINDOW, at(9, 23), at(10, 1), confirmed_at=at(9, 10))
+    closure = override(K.CLOSED_WINDOW, at(9, 22), at(10, 0, 30), confirmed_at=at(9, 12))
+    assert decide(at(9, 23, 30), opening, closure).closure == closure
+    assert decide(at(10, 0, 15), opening, closure).closure == closure
     assert decide(at(10, 0, 45), opening, closure).accepting
     assert hours(opening, closure) == "09:00 a 22:00 y 00:30 a 01:00"
-    assert report_due_at(S, [opening, closure], D) == at(10, 1)  # closures never move it
+    assert report_due_at(S, [opening, closure], D) == at(10, 1)
 
 
-def test_closed_today_also_closes_the_openings_of_the_day() -> None:
-    """RN-26: closed_today runs to the end of the business day, extra openings included."""
-    opening = override(K.OPEN_WINDOW, at(9, 23), at(10, 1))
-    closed = override(K.CLOSED_TODAY, at(9, 20), at(10, 5), reason="lluvia")
-    assert decide(at(10, 0, 30), opening, closed).closure == closed
-    assert hours(opening, closed) == "09:00 a 20:00"
+def test_until_further_notice_then_later_opening() -> None:
+    forever = override(K.CLOSED_UNTIL_FURTHER_NOTICE, at(8, 21), None, confirmed_at=at(8, 21))
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(10, 1), confirmed_at=at(9, 12))
+    assert decide(at(9, 12), forever, opening).closure == forever
+    assert decide(at(9, 20), forever, opening).accepting
+    assert decide(at(10, 0, 30), forever, opening).accepting
+    assert decide(at(10, 1), forever, opening).closure == forever
+    assert hours(forever, opening) == "19:00 a 01:00"
+    assert hours(forever, opening, day=D + dt.timedelta(1)) == "cerrado todo el día"
+
+
+def test_opening_then_later_until_further_notice() -> None:
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(10, 1), confirmed_at=at(9, 10))
+    forever = override(K.CLOSED_UNTIL_FURTHER_NOTICE, at(9, 12), None, confirmed_at=at(9, 12))
+    assert decide(at(9, 20), opening, forever).closure == forever
+    assert hours(opening, forever) == "09:00 a 12:00"
+
+
+def test_three_layers_follow_confirmation_order() -> None:
+    """closure (10:00) < opening (12:00) < closure (14:00), in any input order."""
+    first = override(K.CLOSED_WINDOW, at(9, 15), at(9, 21), confirmed_at=at(9, 10), id=1)
+    opening = override(K.OPEN_WINDOW, at(9, 16), at(9, 20), confirmed_at=at(9, 12), id=2)
+    last = override(K.CLOSED_WINDOW, at(9, 17), at(9, 18), confirmed_at=at(9, 14), id=3)
+    for layers in ((first, opening, last), (last, opening, first)):
+        assert hours(*layers) == "09:00 a 15:00, 16:00 a 17:00, 18:00 a 20:00 y 21:00 a 23:00"
+        assert decide(at(9, 15, 30), *layers).closure == first
+        assert decide(at(9, 16, 30), *layers).accepting
+        assert decide(at(9, 17, 30), *layers).closure == last
+
+
+def test_same_confirmation_time_tiebreaks_on_id() -> None:
+    same = at(9, 12)
+    closure = override(K.CLOSED_WINDOW, at(9, 15), at(9, 18), confirmed_at=same, id=7)
+    opening = override(K.OPEN_WINDOW, at(9, 15), at(9, 18), confirmed_at=same, id=8)
+    assert decide(at(9, 16), closure, opening).accepting
+    later_closure = override(K.CLOSED_WINDOW, at(9, 15), at(9, 18), confirmed_at=same, id=9)
+    assert decide(at(9, 16), closure, opening, later_closure).closure == later_closure
+
+
+def test_reported_closure_is_the_widest_of_the_winning_ones() -> None:
+    forever = override(K.CLOSED_UNTIL_FURTHER_NOTICE, at(9, 9), None, confirmed_at=at(9, 9))
+    opening = override(K.OPEN_WINDOW, at(9, 15), at(9, 20), confirmed_at=at(9, 12))
+    window = override(K.CLOSED_WINDOW, at(9, 16), at(9, 17), confirmed_at=at(9, 14))
+    overrides = (forever, opening, window)
+    assert decide(at(9, 16, 30), *overrides).closure == window  # forever is overridden here
+    assert decide(at(9, 15, 30), *overrides).accepting
+    assert decide(at(9, 21), *overrides).closure == forever
+    assert closures_in_effect(overrides, at(9, 16, 30)) == [forever, window]
+    assert winning_closures(overrides, at(9, 16, 30)) == [window]
+
+
+def test_overridden_in_overlap_lists_what_the_new_instruction_replaces() -> None:
+    rain = override(K.CLOSED_TODAY, at(9, 10), at(10, 5), confirmed_at=at(9, 10), id=1)
+    window = override(K.CLOSED_WINDOW, at(9, 21), at(9, 22), confirmed_at=at(9, 11), id=2)
+    opening = override(K.OPEN_WINDOW, at(9, 19), at(9, 23), id=None)  # being proposed
+    assert overridden_in_overlap([rain, window], opening, at(9, 18)) == [rain, window]
+    # The same opening already confirmed, then a closure that only overlaps it.
+    applied = override(K.OPEN_WINDOW, at(9, 19), at(9, 23), confirmed_at=at(9, 12), id=3)
+    late = override(K.CLOSED_WINDOW, at(9, 20), at(9, 21), id=None)
+    assert overridden_in_overlap([rain, applied], late, at(9, 18)) == [applied]
+    # A closure masked by a later closure is not the one being replaced.
+    masked = override(K.CLOSED_WINDOW, at(9, 19), at(9, 20), confirmed_at=at(9, 9), id=4)
+    assert overridden_in_overlap([masked, rain], opening, at(9, 18)) == [rain]
+    # Past parts do not count: from ``now`` on.
+    early = override(K.OPEN_WINDOW, at(9, 6), at(9, 8), confirmed_at=at(9, 5), id=5)
+    morning_cut = override(K.CLOSED_WINDOW, at(9, 7), at(9, 12), id=None)
+    assert overridden_in_overlap([early], morning_cut, at(9, 8)) == []
 
 
 def test_widest_closure_is_reported() -> None:
