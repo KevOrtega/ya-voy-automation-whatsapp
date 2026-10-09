@@ -105,3 +105,15 @@ def store_lock(
     """The store's intake lock; waits at most one TTL (the holder's lease) to acquire it."""
     ttl = store_lock_ttl_seconds(settings)
     return redis_lock(redis, store_lock_key(store_id), ttl_seconds=ttl, wait_seconds=ttl)
+
+
+def admin_lock_key(admin_phone: str) -> str:
+    return f"lock:admin:{admin_phone}"
+
+
+def admin_lock(
+    redis: Redis, settings: Settings, admin_phone: str
+) -> AbstractAsyncContextManager[RedisLock]:
+    """Serializes one admin's schedule messages (RN-24) around the parser call; same TTL rule."""
+    ttl = store_lock_ttl_seconds(settings)
+    return redis_lock(redis, admin_lock_key(admin_phone), ttl_seconds=ttl, wait_seconds=ttl)

@@ -15,6 +15,7 @@ from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import backoff_delay, send_outbound
 from ya_voy.worker.ratelimit import window_key
 from ya_voy.worker.routing import Route, is_private, route_event
+from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.settings import build_cron_jobs, cron_schedule
 from ya_voy.worker.sweeps import recover_inbound_events, recover_outbound_messages
 
@@ -53,7 +54,13 @@ def test_worker_registers_stage_3_jobs_and_sweeps() -> None:
     assert send_outbound in WorkerSettings.functions
     assert evaluate_draft in WorkerSettings.functions
     names = {job.coroutine for job in WorkerSettings.cron_jobs}
-    assert names == {recover_inbound_events, recover_outbound_messages, expire_drafts}
+    assert names == {
+        recover_inbound_events,
+        recover_outbound_messages,
+        expire_drafts,
+        expire_schedule_confirmations,
+        remind_still_closed,
+    }
 
 
 @pytest.mark.parametrize(

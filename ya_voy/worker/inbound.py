@@ -83,7 +83,13 @@ async def _process_locked(
         #       inbound_event_id=row.id, wa_message_id=..., quoted_wa_message_id=...),
         #       finalize=<mark the event processed if it is still `received`>)
         # then drafts.after_commit(ctx, result). PRIVATE_NON_TEXT -> store_unsupported_media.
-        # Group reactions are stage 5.
+        # Before intake, the RN-18 gate: schedule.repository.is_accepting_orders(); when closed,
+        # reply messaging.schedule_texts.store_closed_reply() at most once per
+        # OUT_OF_HOURS_REPLY_COOLDOWN_MINUTES (CU-10). Group reactions are stage 5.
+        # TODO(stage-7b): an admin (ADMIN_PHONES, by number or @lid) -> the same pattern with
+        #   schedules.handle_admin_text(ctx, schedule_admin.AdminText(admin_phone=...,
+        #       reply_jid=..., text=..., inbound_event_id=row.id), finalize=...)
+        # then schedules.after_commit(ctx, result).
         row.status = InboundEventStatus.PROCESSED
     row.processed_at = now
     return str(route), outbound_ids

@@ -11,8 +11,8 @@ from arq.cron import CronJob
 
 from ya_voy.config import get_settings
 from ya_voy.db.session import create_engine, create_session_factory
-from ya_voy.llm.factory import LLMConfigError, build_order_extractor
-from ya_voy.llm.unavailable import UnavailableOrderExtractor
+from ya_voy.llm.factory import LLMConfigError, build_order_extractor, build_schedule_parser
+from ya_voy.llm.unavailable import UnavailableOrderExtractor, UnavailableScheduleParser
 from ya_voy.logging import configure_logging
 from ya_voy.queue import redis_settings_from_url
 from ya_voy.whatsapp.client import EvolutionClient
@@ -20,6 +20,7 @@ from ya_voy.worker import jobs
 from ya_voy.worker.drafts import evaluate_draft, expire_drafts
 from ya_voy.worker.inbound import process_inbound_event
 from ya_voy.worker.outbound import send_outbound
+from ya_voy.worker.schedules import expire_schedule_confirmations, remind_still_closed
 from ya_voy.worker.sweeps import recover_inbound_events, recover_outbound_messages
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ def build_cron_jobs(interval_seconds: int) -> list[CronJob]:
         cron(recover_inbound_events, run_at_startup=True, **schedule),
         cron(recover_outbound_messages, run_at_startup=True, **schedule),
         cron(expire_drafts, run_at_startup=True, **schedule),
+        cron(expire_schedule_confirmations, run_at_startup=True, **schedule),
+        cron(remind_still_closed, run_at_startup=True, **schedule),
     ]
 
 
@@ -58,17 +61,21 @@ async def on_startup(ctx: dict[str, Any]) -> None:
     ctx["evolution"] = EvolutionClient.from_settings(settings)
     try:
         ctx["order_extractor"] = build_order_extractor(settings)
+        ctx["schedule_parser"] = build_schedule_parser(settings)
     except LLMConfigError as exc:
-        # Keep the worker up: extraction then fails like an outage (CU-01 6a).
+        # Development only (production requires the LLM settings): calls then fail like an
+        # outage (CU-01 6a, CU-14 1b).
         logger.error("LLM not configured", extra={"error": str(exc)})
         ctx["order_extractor"] = UnavailableOrderExtractor(str(exc))
+        ctx["schedule_parser"] = UnavailableScheduleParser(str(exc))
     logger.info("worker started", extra={"app_env": settings.app_env})
 
 
 async def on_shutdown(ctx: dict[str, Any]) -> None:
-    extractor = ctx.get("order_extractor")
-    if hasattr(extractor, "aclose"):
-        await extractor.aclose()
+    for name in ("order_extractor", "schedule_parser"):
+        client = ctx.get(name)
+        if hasattr(client, "aclose"):
+            await client.aclose()
     evolution = ctx.get("evolution")
     if evolution is not None:
         await evolution.aclose()
@@ -85,7 +92,7 @@ class WorkerSettings:
         send_outbound,
         evaluate_draft,
     ]
-    # TODO(stage 5+): unclaimed alert, schedule reminders, reports, retention.
+    # TODO(stage 5+): unclaimed alert, reports, retention.
     cron_jobs: ClassVar[list[Any]] = build_cron_jobs(get_settings().scheduler_interval_seconds)
     on_startup = on_startup
     on_shutdown = on_shutdown
